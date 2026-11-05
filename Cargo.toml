@@ -1,0 +1,87 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dyplayer-vfs",
+    "crates/dyplayer-proxy",
+    "crates/dyplayer-mpv",
+    "crates/dyplayer-danmaku",
+    "crates/dyplayer-store",
+    "crates/dyplayer-danmu-api",
+    "crates/dyplayer-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+dyplayer-vfs = { path = "crates/dyplayer-vfs" }
+dyplayer-proxy = { path = "crates/dyplayer-proxy" }
+dyplayer-mpv = { path = "crates/dyplayer-mpv" }
+dyplayer-danmaku = { path = "crates/dyplayer-danmaku" }
+dyplayer-store = { path = "crates/dyplayer-store" }
+dyplayer-danmu-api = { path = "crates/dyplayer-danmu-api" }
+
+md-5 = "0.10"
+brotli = "7"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+ecb = { version = "0.1", features = ["alloc", "block-padding"] }
+hmac = "0.12"
+sha2 = "0.10"
+
+
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "clipboard", "links"] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["svg"] }
+egui-wgpu = "0.37"
+egui_glow = "0.37"
+epaint = "0.37"
+
+libloading = "0.8"
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+windows = { version = "0.62", features = [
+    "Win32_Devices_Display",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_WNet",
+    "Win32_System_Registry",
+] }
+
+rusqlite = { version = "0.37", features = ["bundled"] }
+keyring = { version = "3", features = ["windows-native"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+dirs = "6"
+natord = "1.0"
+encoding_rs = "0.8"
+rfd = "0.15"
+
+ureq = "3"
+tiny_http = "0.12"
+quick-xml = "0.38"
+percent-encoding = "2"
+base64 = "0.22"
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+lto = "thin"
+
+debug = "line-tables-only"

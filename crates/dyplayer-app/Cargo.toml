@@ -1,0 +1,44 @@
+[package]
+name = "dyplayer-app"
+description = "DyPlayer egui application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dyplayer"
+path = "src/main.rs"
+
+[features]
+default = ["backend-wgpu"]
+backend-wgpu = ["eframe/default", "dep:egui-wgpu", "dep:wgpu"]
+backend-glow = ["eframe/glow", "dep:egui_glow"]
+
+[dependencies]
+dyplayer-mpv = { workspace = true }
+dyplayer-danmaku = { workspace = true }
+dyplayer-store = { workspace = true }
+dyplayer-vfs = { workspace = true }
+dyplayer-proxy = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+# M2 弹幕覆盖窗口（overlay_window.rs：winit + wgpu + egui_wgpu::Renderer）
+# glow 后端（老设备版）无覆盖层，egui-wgpu/wgpu 仅 backend-wgpu feature 下启用
+egui-wgpu = { workspace = true, optional = true }
+egui_glow = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+winit = { workspace = true }
+pollster = { workspace = true }
+
+raw-window-handle = "0.6"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+windows = { workspace = true }
+rfd = { workspace = true }
+encoding_rs = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

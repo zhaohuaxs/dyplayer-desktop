@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg width="108" height="108" viewBox="0 0 108 108" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gradient_1" gradientUnits="userSpaceOnUse" x1="74.506" y1="20.345" x2="-19.791" y2="86.074">
+      <stop offset="0.394" stop-color="#7225EB" />
+      <stop offset="0.651" stop-color="#AE64F6" />
+    </linearGradient>
+    <linearGradient id="gradient_2" gradientUnits="userSpaceOnUse" x1="31.833" y1="15.411" x2="-8.456" y2="84.76">
+      <stop offset="0.335" stop-color="#7225EB" />
+      <stop offset="0.651" stop-color="#AE64F6" />
+    </linearGradient>
+  </defs>
+  <g transform="scale(1 1)">
+    <g transform="matrix(1 0 0 1 13 11)">
+      <path d="M0 74.7421L0 9.76727C0 2.24555 7.7429 -2.55554 13.9056 1.44537L51.7791 25.4779L43.5352 64.2627L13.9056 83.064C7.7429 87.0649 0 82.2638 0 74.7421Z" fill="url(#gradient_1)" fill-rule="evenodd" />
+      <path d="M11.0613 83.219C4.89857 83.219 0 78.2579 3.8147e-06 72.0164C3.8147e-06 72.0164 -3.8147e-06 11.2026 -3.8147e-06 11.2026C0 4.96113 4.89857 0 11.0613 -9.53674e-07C17.224 -9.53674e-07 22.1226 4.96113 22.1226 11.2026C22.1226 11.2026 22.1226 72.0164 22.1226 72.0164C22.1226 78.2579 17.224 83.219 11.0613 83.219C11.0613 83.219 11.0613 83.219 11.0613 83.219Z" fill="url(#gradient_2)" transform="matrix(0.978 0.208 -0.208 0.978 59.469 0)" />
+    </g>
+  </g>
+</svg>

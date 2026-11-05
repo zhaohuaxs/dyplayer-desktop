@@ -1,0 +1,15 @@
+[package]
+name = "dyplayer-proxy"
+description = "Local HTTP Range streaming proxy over VFS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dyplayer-vfs = { workspace = true }
+tiny_http = { workspace = true }
+percent-encoding = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+[dev-dependencies]
+ureq = { workspace = true }

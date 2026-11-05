@@ -1,0 +1,22 @@
+[package]
+name = "dyplayer-mpv"
+description = "libmpv render API embedded engine (main) + external mpv IPC (optional, M1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading = { workspace = true }
+windows = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+# PoC-2（透明覆盖窗口叠 mpv wid 视频，docs/m2-overlay-danmaku.md §3）：
+# 版本与 workspace lock 对齐（wgpu 30.0.1 / winit 0.30.13 / pollster 0.4 /
+# raw-window-handle 0.6.2），不引入新编译单元。
+winit = "0.30"
+wgpu = "30"
+pollster = "0.4"
+raw-window-handle = "0.6"

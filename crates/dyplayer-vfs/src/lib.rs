@@ -12,8 +12,8 @@ pub mod webdav;
 
 pub use local::LocalFs;
 pub use media::{
-    SubtitleCandidate, extension_of, is_subtitle_file, is_video_file, match_subtitles_for,
-    natural_cmp,
+    SubtitleCandidate, VIDEO_EXTENSIONS, extension_of, is_subtitle_file, is_video_file,
+    match_subtitles_for, natural_cmp,
 };
 pub use smb::{SmbConfig, SmbFs};
 pub use source::VfsSource;

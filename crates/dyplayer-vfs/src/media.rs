@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
+pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "webm", "avi", "mov", "flv", "ts", "m2ts", "mpg", "mpeg", "rm", "rmvb", "wmv",
     "m4v", "iso", "ogv", "3gp",
 ];

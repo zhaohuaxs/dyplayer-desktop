@@ -22,6 +22,10 @@ pub struct UiConfig {
     pub accent: u8,
     /// UI 主字体（应用自带 / 系统字体显示名，如 "微软雅黑"）。
     pub font: FontChoice,
+    /// 是否注册 Windows 文件右键菜单"使用 DyPlayer 打开"。
+    pub context_menu_enabled: bool,
+    /// 是否注册到 Windows "打开方式"列表（视频文件 → 打开方式 → DyPlayer）。
+    pub open_with_enabled: bool,
 }
 
 impl Default for UiConfig {
@@ -32,6 +36,8 @@ impl Default for UiConfig {
             startup_view: StartupView::default(),
             accent: 3,
             font: FontChoice::default(),
+            context_menu_enabled: false,
+            open_with_enabled: false,
         }
     }
 }

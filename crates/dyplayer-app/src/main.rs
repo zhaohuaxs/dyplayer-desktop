@@ -3,6 +3,7 @@
 
 mod browser;
 mod browse_ui;
+mod context_menu;
 mod danmaku_ui;
 mod drop_play;
 mod fs_patch;
@@ -92,10 +93,12 @@ struct DyPlayerApp {
     /// glow GL context（glow 后端 only；wgpu 后端不存在此字段）。
     #[cfg(not(feature = "backend-wgpu"))]
     gl: Option<std::sync::Arc<eframe::glow::Context>>,
+    /// 命令行传入的待播放文件（右键菜单打开）：首帧消费调 start_play。
+    pending_cli_play: Option<PendingPlay>,
 }
 
 impl DyPlayerApp {
-    fn new(cc: &eframe::CreationContext) -> anyhow::Result<Self> {
+    fn new(cc: &eframe::CreationContext, cli_file: Option<PathBuf>) -> anyhow::Result<Self> {
         let mut config = dyplayer_store::AppConfig::load_or_default()?;
         // GPU 渲染路径门禁：仅纯软件 WARP（所有适配器均为 Cpu）时禁用——
         // vo=gpu-next 的 D3D11 呈现在无任何 GPU 驱动的环境不可用 → 视频区黑屏。
@@ -175,6 +178,12 @@ impl DyPlayerApp {
             .flatten()
             .as_deref()
             != Some(store.local_date().as_str());
+        let pending_cli_play = cli_file.and_then(|path| {
+            let items = drop_play::classify_dropped(vec![path]);
+            let plan = drop_play::build_drop_playlist(&items);
+            plan.pending
+        });
+
         let mut app = Self {
             screen: startup_screen,
 
@@ -205,12 +214,16 @@ impl DyPlayerApp {
             stream_headers: String::new(),
             #[cfg(not(feature = "backend-wgpu"))]
             gl: cc.gl.clone(),
+            pending_cli_play,
         };
         spawn_freeze_watchdog(Arc::clone(&app.probe));
         app.browse_ui.hw_gpu_available = hw_gpu;
         app.reload_sources();
         app.browse_ui.sync_ui_cfg(&app.config.ui, &app.config.engine);
         app.browse_ui.ensure_data(&app.store, &mut app.browser);
+
+        context_menu::sync(app.config.ui.context_menu_enabled);
+        context_menu::sync_open_with(app.config.ui.open_with_enabled);
 
         if !app.sources.is_empty() {
             app.browser.set_active_source(Some(0), &app.sources);
@@ -750,6 +763,12 @@ impl eframe::App for DyPlayerApp {
             self.style_applied = Some((dark, self.config.ui.accent));
         }
 
+        // 命令行文件播放（右键菜单打开）：首帧消费，与拖放走同一 start_play 路径。
+        if let Some(pending) = self.pending_cli_play.take() {
+            let ctx = ui.ctx().clone();
+            self.start_play(&ctx, pending);
+        }
+
         // 拖放组队后台回流 poll：拿到 plan 后执行 start_play / XML / 通知。
         if let Some(rx) = &self.pending_drop {
             match rx.try_recv() {
@@ -1271,6 +1290,30 @@ impl eframe::App for DyPlayerApp {
                             self.rebuild_session(&ctx, "高级参数已更新，返回播放页生效", false);
                             continue;
                         }
+                        browse_ui::PendingUiChange::ContextMenu(enabled) => {
+                            self.config.ui.context_menu_enabled = enabled;
+                            if enabled {
+                                if let Err(e) = context_menu::register() {
+                                    self.browse_ui.notify(format!("右键菜单注册失败: {e}"));
+                                    tracing::warn!("右键菜单注册失败: {e}");
+                                }
+                            } else if let Err(e) = context_menu::unregister() {
+                                self.browse_ui.notify(format!("右键菜单注销失败: {e}"));
+                                tracing::warn!("右键菜单注销失败: {e}");
+                            }
+                        }
+                        browse_ui::PendingUiChange::OpenWith(enabled) => {
+                            self.config.ui.open_with_enabled = enabled;
+                            if enabled {
+                                if let Err(e) = context_menu::register_open_with() {
+                                    self.browse_ui.notify(format!("打开方式注册失败: {e}"));
+                                    tracing::warn!("打开方式注册失败: {e}");
+                                }
+                            } else if let Err(e) = context_menu::unregister_open_with() {
+                                self.browse_ui.notify(format!("打开方式注销失败: {e}"));
+                                tracing::warn!("打开方式注销失败: {e}");
+                            }
+                        }
                     }
                     self.save_ui_config();
                 }
@@ -1744,6 +1787,10 @@ fn load_icon() -> egui::IconData {
 fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    let cli_file: Option<PathBuf> = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from);
+
     let icon = load_icon();
     let options = eframe::NativeOptions {
         renderer: {
@@ -1776,7 +1823,7 @@ fn main() -> anyhow::Result<()> {
         "DyPlayer",
         options,
         Box::new(move |cc| {
-            let app = DyPlayerApp::new(cc)?;
+            let app = DyPlayerApp::new(cc, cli_file)?;
             Ok(Box::new(app))
         }),
     )

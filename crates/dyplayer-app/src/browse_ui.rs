@@ -120,6 +120,10 @@ pub struct BrowseUiState {
     /// 引擎高级参数镜像（多行文本，每行一个 name=value；从 config.engine 同步）。
     /// 会话重建型：mpv 初始化期选项。编辑器失焦/回车时 push pending_ui。
     ui_extra_args: String,
+    /// 右键菜单开关镜像（从 config.ui.context_menu_enabled 同步）。
+    ui_context_menu: bool,
+    /// "打开方式"开关镜像（从 config.ui.open_with_enabled 同步）。
+    ui_open_with: bool,
     /// 是否存在硬件 GPU 适配器（App::new 检测 wgpu 枚举结果）。false =
     /// 虚拟机/远程桌面等无硬件 3D 环境：GPU 渲染切换禁用（D3D11 呈现
     /// 不可用会黑屏），启动已静默回退 sw。
@@ -185,6 +189,10 @@ pub enum PendingUiChange {
     QualityPreset(String),
     /// 引擎高级参数（name=value 列表，会话重建型：mpv 初始化期选项）。
     ExtraArgs(Vec<String>),
+    /// 右键菜单开关（注册/注销 Windows 文件右键菜单项）。
+    ContextMenu(bool),
+    /// "打开方式"开关（注册/注销 ProgID + OpenWithProgids）。
+    OpenWith(bool),
 }
 
 /// 播放记录清除目标（右键单条 / 清除全部 / 分区清除全部）。
@@ -340,6 +348,8 @@ impl BrowseUiState {
             ui_render_gpu: false,
             ui_quality_preset: "high".into(),
             ui_extra_args: String::new(),
+            ui_context_menu: false,
+            ui_open_with: false,
             hw_gpu_available: true,
             pending_ui: Vec::new(),
             show_icon_browser: false,
@@ -366,6 +376,8 @@ impl BrowseUiState {
         self.ui_render_gpu = engine.render_path.eq_ignore_ascii_case("gpu");
         self.ui_quality_preset = engine.quality_preset.clone();
         self.ui_extra_args = engine.extra_args.join("\n");
+        self.ui_context_menu = ui.context_menu_enabled;
+        self.ui_open_with = ui.open_with_enabled;
     }
 
     /// 进入时刷新真实数据（recent / favorites / 媒体库缓存，
@@ -1264,6 +1276,56 @@ fn ui_settings(
                             state.ui_startup = v;
                             state.pending_ui.push(PendingUiChange::Startup(v));
                         }
+                    }
+                });
+            });
+            settings_group(ui, palette, "系统集成", |ui| {
+                settings_row(ui, palette, "右键菜单", |ui| {
+                    let resp = seg_pill(
+                        ui,
+                        "开启",
+                        state.ui_context_menu,
+                        palette,
+                    )
+                    .on_hover_text("注册 Windows 文件右键菜单\"使用 DyPlayer 打开\"（仅当前用户，无需管理员权限）");
+                    if resp.clicked() && !state.ui_context_menu {
+                        state.ui_context_menu = true;
+                        state.pending_ui.push(PendingUiChange::ContextMenu(true));
+                    }
+                    let resp_off = seg_pill(
+                        ui,
+                        "关闭",
+                        !state.ui_context_menu,
+                        palette,
+                    )
+                    .on_hover_text("移除右键菜单项");
+                    if resp_off.clicked() && state.ui_context_menu {
+                        state.ui_context_menu = false;
+                        state.pending_ui.push(PendingUiChange::ContextMenu(false));
+                    }
+                });
+                settings_row(ui, palette, "打开方式", |ui| {
+                    let resp = seg_pill(
+                        ui,
+                        "开启",
+                        state.ui_open_with,
+                        palette,
+                    )
+                    .on_hover_text("将 DyPlayer 添加到视频文件的\"打开方式\"列表（可设为默认播放器）");
+                    if resp.clicked() && !state.ui_open_with {
+                        state.ui_open_with = true;
+                        state.pending_ui.push(PendingUiChange::OpenWith(true));
+                    }
+                    let resp_off = seg_pill(
+                        ui,
+                        "关闭",
+                        !state.ui_open_with,
+                        palette,
+                    )
+                    .on_hover_text("从\"打开方式\"列表移除 DyPlayer");
+                    if resp_off.clicked() && state.ui_open_with {
+                        state.ui_open_with = false;
+                        state.pending_ui.push(PendingUiChange::OpenWith(false));
                     }
                 });
             });

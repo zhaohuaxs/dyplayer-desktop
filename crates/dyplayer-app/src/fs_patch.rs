@@ -33,11 +33,14 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::core::{s, w};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWL_STYLE, GWLP_WNDPROC, GetWindowLongW, GetWindowPlacement, IsZoomed,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowLongW,
@@ -134,6 +137,59 @@ fn set_dwm_border_color(hwnd: HWND, color: u32) {
     }
 }
 
+/// 当前系统 build 号（`RtlGetVersion`：不受 manifest 兼容性声明影响）。
+fn os_build() -> Option<u32> {
+    static BUILD: OnceLock<Option<u32>> = OnceLock::new();
+    *BUILD.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let proc = GetProcAddress(ntdll, s!("RtlGetVersion"))?;
+        let f: unsafe extern "system" fn(*mut OsVersionInfoW) -> i32 = std::mem::transmute(proc);
+        let mut vi = OsVersionInfoW {
+            size: std::mem::size_of::<OsVersionInfoW>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        (f(&mut vi) == 0).then_some(vi.build)
+    })
+}
+
+/// `RtlGetVersion` 的 `OSVERSIONINFOW`（自行声明以避开 WDK 依赖）。
+#[repr(C)]
+struct OsVersionInfoW {
+    size: u32,
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform: u32,
+    csd: [u16; 128],
+}
+
+/// Win10 1703（Creators Update）build 号。低于它（1507/1511/1607）的 DWM
+/// 按窗口样式自绘非客户区，`WM_NCCALCSIZE` 归零挡不住 → 呈现侧 caption 偏移。
+const BUILD_CREATORS: u32 = 15063;
+
+/// 是否走老系统（< 1703）的无标题栏兼容路径。
+fn legacy_frame() -> bool {
+    os_build().is_some_and(|b| b < BUILD_CREATORS)
+}
+
+/// 老系统上阻止 DWM 绘制非客户区。dyplayer 已摘 `WS_CAPTION`，此处补
+/// `DWMNCRP_DISABLED` 兜底（部分 1607 上仅摘 CAPTION 不够）。
+fn disable_nc_rendering(hwnd: HWND) {
+    unsafe {
+        let policy = DWMNCRP_DISABLED;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &policy as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&policy) as u32,
+        );
+    }
+}
+
 /// 装子类（幂等——只装一次，防叠层：常态无边框与全屏共用同一子类）。
 unsafe fn ensure_subclass(hwnd: HWND) {
     if SUBCLASS_INSTALLED.swap(true, Ordering::Relaxed) {
@@ -160,6 +216,9 @@ pub fn install_borderless(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
         );
         set_dwm_border_color(hwnd, DWMWA_COLOR_NONE);
+        if legacy_frame() {
+            disable_nc_rendering(hwnd);
+        }
     }
 }
 
@@ -183,6 +242,32 @@ fn borderless_of(cur: u32) -> u32 {
     (cur & !(WS_CAPTION.0 | WS_BORDER.0)) | BORDERLESS_WINDOWED_STYLE
 }
 
+/// glow 后端 1607 兼容：摘 WS_CAPTION + DWMNCRP_DISABLED 阻止 DWM 画系统标题栏。
+/// 不装子类、不补 THICKFRAME（避免 glow + THICKFRAME 全黑）。非 legacy 系统无操作。
+#[cfg(not(feature = "backend-wgpu"))]
+fn glow_strip_caption(hwnd: HWND) {
+    if !legacy_frame() {
+        return;
+    }
+    unsafe {
+        let cur = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let stripped = cur & !WS_CAPTION.0;
+        if stripped != cur {
+            SetWindowLongW(hwnd, GWL_STYLE, stripped as i32);
+        }
+        disable_nc_rendering(hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 /// ui() 首帧调用（仅首次生效）：把 winit 装饰窗口切成自管无边框。
 /// 替代 `with_decorations(false)`（该路径在 Win10 虚拟机 DWM 呈现失效 → 全黑）。
 pub fn prime_borderless(frame: &eframe::Frame) {
@@ -201,6 +286,10 @@ pub fn prime_borderless(frame: &eframe::Frame) {
         {
             install_borderless(hwnd);
             tracing::info!("BORDERLESS: 常态无边框已安装（THICKFRAME+NCCALCSIZE，替代 with_decorations(false)）");
+        }
+        #[cfg(not(feature = "backend-wgpu"))]
+        {
+            glow_strip_caption(hwnd);
         }
     }
 }
@@ -232,8 +321,40 @@ pub fn maintain_borderless() {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
                 );
                 set_dwm_border_color(hwnd, DWMWA_COLOR_NONE);
+                if legacy_frame() {
+                    disable_nc_rendering(hwnd);
+                }
             }
             tracing::warn!("BORDERLESS: 窗口样式被外方改写（winit refresh），已自愈");
+        }
+    }
+    #[cfg(not(feature = "backend-wgpu"))]
+    {
+        if FULLSCREEN.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(hwnd) = MAIN_HWND.get().map(|h| HWND(*h as *mut core::ffi::c_void)) else {
+            return;
+        };
+        if !legacy_frame() {
+            return;
+        }
+        let cur = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+        if cur & WS_CAPTION.0 != 0 {
+            unsafe {
+                SetWindowLongW(hwnd, GWL_STYLE, (cur & !WS_CAPTION.0) as i32);
+                disable_nc_rendering(hwnd);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+            }
+            tracing::warn!("BORDERLESS: glow 窗口样式被外方改写（winit refresh），已自愈");
         }
     }
 }

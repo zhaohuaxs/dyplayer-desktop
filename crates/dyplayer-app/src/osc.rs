@@ -1527,8 +1527,17 @@ fn queue_card(
         || lui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
 
     const ROW_H: f32 = 40.0;
-    let list_h = (st.queue_titles.len() as f32 * ROW_H).min(ROW_H * 9.0);
-    let size = vec2(300.0, 18.0 + 26.0 + 6.0 + list_h + 18.0);
+    const MAX_ROWS: f32 = 15.0;
+    const CARD_OVERHEAD: f32 = 18.0 + 26.0 + 6.0 + 18.0;
+    let max_by_screen = if let Some(a) = anchor {
+        (a.y - screen.top() - CARD_OVERHEAD - 8.0).max(ROW_H * 3.0)
+    } else {
+        ROW_H * MAX_ROWS
+    };
+    let list_h = (st.queue_titles.len() as f32 * ROW_H)
+        .min(max_by_screen)
+        .min(ROW_H * MAX_ROWS);
+    let size = vec2(300.0, CARD_OVERHEAD + list_h);
     let card = settings_card_rect(screen, anchor, size);
     let p = lui.painter();
     p.rect_filled(card, CornerRadius::same(14), settings_card_bg());
@@ -1652,13 +1661,14 @@ pub(crate) fn queue_row(
         );
     }
     let text_color = if current { theme.text } else { theme.text_dim };
+    let text_x = rect.left() + 14.0 + 24.0 * (if current { 1.0 } else { t });
     paint_left_center_truncated(
         p,
-        pos2(rect.left() + 38.0, rect.center().y),
+        pos2(text_x, rect.center().y),
         title,
         osc_font(13.0),
         text_color,
-        rect.width() - 38.0 - 14.0,
+        rect.right() - text_x - 14.0,
     );
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(title)

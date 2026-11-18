@@ -25,6 +25,7 @@ pub(crate) enum Glyph {
     Pencil,
     Grid,
     Settings,
+    Stop,
 }
 
 /// 媒体源类型 → 图标（侧栏源行 / 源卡片）。
@@ -65,10 +66,20 @@ pub(crate) fn paint_glyph(p: &Painter, glyph: Glyph, rect: Rect, color: Color32)
         Glyph::Pencil => paint_pencil(p, rect, color),
         Glyph::Grid => paint_grid(p, rect, color),
         Glyph::Settings => paint_settings(p, rect, color),
+        Glyph::Stop => paint_stop(p, rect, color),
     }
 }
 
-/// 设置齿轮：外圈 + 内圈 + 8 齿短块（线宽随尺寸缩放）。
+fn paint_stop(p: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let half = rect.size().min_elem() * 0.28;
+    p.rect_filled(
+        Rect::from_min_max(pos2(c.x - half, c.y - half), pos2(c.x + half, c.y + half)),
+        CornerRadius::same(2),
+        color,
+    );
+}
+
 fn paint_settings(p: &Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let r = rect.size().min_elem() * 0.30;

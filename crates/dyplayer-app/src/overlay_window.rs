@@ -36,7 +36,6 @@ use crate::danmaku_ui::DanmakuOverlay;
 const CLASS_NAME: &str = "DyPlayerDanmakuOverlay";
 
 const WS_POPUP: u32 = 0x8000_0000;
-const WS_VISIBLE: u32 = 0x1000_0000;
 
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
@@ -77,8 +76,16 @@ unsafe extern "system" {
     fn DestroyWindow(hwnd: usize) -> i32;
     fn PeekMessageW(msg: *mut Msg, hwnd: usize, min: u32, max: u32, remove: u32) -> i32;
     fn DispatchMessageW(msg: *const Msg) -> isize;
-    fn SetCapture(hwnd: usize) -> usize;
-    fn ReleaseCapture() -> i32;
+    fn GetCursorPos(pt: *mut Point) -> i32;
+    fn ScreenToClient(hwnd: usize, pt: *mut Point) -> i32;
+    fn GetAsyncKeyState(vk: i32) -> i16;
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct Point {
+    x: i32,
+    y: i32,
 }
 
 #[repr(C)]
@@ -114,6 +121,11 @@ const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+/// MA_NOACTIVATE：不激活但照常投递点击。实测本窗口类上 DefWindowProcW
+/// 对 WM_MOUSEACTIVATE 返回 MA_ACTIVATE（WS_EX_NOACTIVATE 不自动生效），
+/// 真单击据此抢前台/焦点——必须显式应答（2026-11-16 根治断点 1 残余）。
+const MA_NOACTIVATE: isize = 3;
 
 /// R19：滚轮事件队列（wheel delta；正=向上，负=向下）。
 static OVERLAY_WHEEL: std::sync::LazyLock<std::sync::Mutex<Vec<i32>>> =
@@ -139,6 +151,10 @@ fn queue_full_warn(kind: &'static str) {
         tracing::warn!(target: "overlay", "{kind} 队列满，累计丢弃 {n} 次（消费端可能卡顿）");
     }
 }
+
+/// 按住按钮掩码（bit0=左 bit1=右；仅覆盖线程读写）。去 SetCapture 后
+/// 拖出窗口的 move/release 补偿据此启用（take_mouse_events poll）。
+static PRESSED_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// F10：OverlayBridge poison 恢复——取中间状态继续运行，只 error 一次避免刷屏。
 fn lock_bridge(
@@ -201,8 +217,14 @@ unsafe extern "system" fn overlay_wnd_proc(
     wp: usize,
     lp: isize,
 ) -> isize {
-    // 鼠标事件入队（render 每帧转译 egui input）。按住拖出窗口期间
-    // SetCapture 保证事件继续到达（egui press/release 配对语义）。
+    // 点击不激活（键盘焦点留在主窗口）；点击消息照常入队投递。
+    if msg == WM_MOUSEACTIVATE {
+        return MA_NOACTIVATE;
+    }
+    // 鼠标事件入队（render 每帧转译 egui input）。**不用 SetCapture**：
+    // 跨线程捕获附着输入队列会把激活/焦点抢进 NOACTIVATE 覆盖层，键盘
+    // 全灭且 alt-tab 救不回（2026-11-13 诊断断点 1）。拖出窗口的
+    // move/release 由 take_mouse_events 按住期间 poll 光标/键态补偿。
     if matches!(
         msg,
         WM_MOUSEMOVE
@@ -220,15 +242,6 @@ unsafe extern "system" fn overlay_wnd_proc(
             q.push((msg, x, y));
         } else {
             queue_full_warn("ov_mouse");
-        }
-        match msg {
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN => unsafe {
-                SetCapture(hwnd);
-            },
-            WM_LBUTTONUP | WM_RBUTTONUP => unsafe {
-                ReleaseCapture();
-            },
-            _ => {}
         }
         return 0;
     }
@@ -258,7 +271,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// - WM_LBUTTONDBLCLK 转译为一次 press+release 对（CS_DBLCLKS 下
 ///   Windows 以 DBLCLK 替代第二次 down——egui 靠两次快 press 判定
 ///   double_clicked）。
-fn take_mouse_events(ppp: f32, host_offset: egui::Vec2) -> Vec<egui::Event> {
+fn take_mouse_events(ppp: f32, host_offset: egui::Vec2, hwnd: usize) -> Vec<egui::Event> {
     type MouseQueue = std::sync::LazyLock<std::sync::Mutex<Vec<(u32, i32, i32)>>>;
     let take_queue = |lock: &MouseQueue| {
         lock.lock()
@@ -278,24 +291,31 @@ fn take_mouse_events(ppp: f32, host_offset: egui::Vec2) -> Vec<egui::Event> {
         egui::pos2(x as f32 / ppp + off.x, y as f32 / ppp + off.y)
     };
     let mut out = Vec::with_capacity(merged.len());
+    use std::sync::atomic::Ordering;
     for (msg, x, y, off) in merged {
         let pos = to_pos(x, y, off);
         use egui::Event as E;
         use egui::PointerButton as PB;
         match msg {
             WM_MOUSEMOVE => out.push(E::PointerMoved(pos)),
-            WM_LBUTTONDOWN => out.push(E::PointerButton {
-                pos,
-                button: PB::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            }),
-            WM_LBUTTONUP => out.push(E::PointerButton {
-                pos,
-                button: PB::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }),
+            WM_LBUTTONDOWN => {
+                PRESSED_MASK.fetch_or(1, Ordering::Relaxed);
+                out.push(E::PointerButton {
+                    pos,
+                    button: PB::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            WM_LBUTTONUP => {
+                PRESSED_MASK.fetch_and(!1, Ordering::Relaxed);
+                out.push(E::PointerButton {
+                    pos,
+                    button: PB::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
             WM_LBUTTONDBLCLK => {
                 out.push(E::PointerButton {
                     pos,
@@ -310,19 +330,56 @@ fn take_mouse_events(ppp: f32, host_offset: egui::Vec2) -> Vec<egui::Event> {
                     modifiers: egui::Modifiers::default(),
                 });
             }
-            WM_RBUTTONDOWN => out.push(E::PointerButton {
-                pos,
-                button: PB::Secondary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            }),
-            WM_RBUTTONUP => out.push(E::PointerButton {
-                pos,
-                button: PB::Secondary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }),
+            WM_RBUTTONDOWN => {
+                PRESSED_MASK.fetch_or(2, Ordering::Relaxed);
+                out.push(E::PointerButton {
+                    pos,
+                    button: PB::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            WM_RBUTTONUP => {
+                PRESSED_MASK.fetch_and(!2, Ordering::Relaxed);
+                out.push(E::PointerButton {
+                    pos,
+                    button: PB::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
             _ => {}
+        }
+    }
+    // 拖出窗口补偿：按住期间每帧 poll 光标/键态补 move/release（替代
+    // SetCapture 的出窗事件续流）。坐标 ScreenToClient 回覆盖层客户区，
+    // 与 own 队列同系；release 落在界外 egui 亦正常结束拖拽。
+    let mask = PRESSED_MASK.load(Ordering::Relaxed);
+    if mask != 0 {
+        let mut pt = Point::default();
+        if unsafe { GetCursorPos(&mut pt) } != 0 && unsafe { ScreenToClient(hwnd, &mut pt) } != 0 {
+            let pos = egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp);
+            out.push(egui::Event::PointerMoved(pos));
+            let l_down = (unsafe { GetAsyncKeyState(0x01) } as u16) & 0x8000 != 0;
+            let r_down = (unsafe { GetAsyncKeyState(0x02) } as u16) & 0x8000 != 0;
+            if mask & 1 != 0 && !l_down {
+                PRESSED_MASK.fetch_and(!1, Ordering::Relaxed);
+                out.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            if mask & 2 != 0 && !r_down {
+                PRESSED_MASK.fetch_and(!2, Ordering::Relaxed);
+                out.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
         }
     }
     // R19：滚轮事件转译（双源合并；delta/120 * 24 ≈ 一格 24 逻辑像素）。
@@ -371,6 +428,7 @@ pub struct OverlayRunState {
     pub delay_seconds: f64,
     pub gradient: bool,
     pub gradient_inset: f64,
+    pub halo: f64,
 }
 
 /// 跨线程状态桥（主线程写几何/时间/配置/加载请求；覆盖线程回写统计）。
@@ -434,11 +492,6 @@ pub struct OverlayBridge {
     /// 宿主 wnd_proc 入队（push_host_mouse_if_overlay）+ 主窗口 egui
     /// 事件镜像（黑边区直达主窗口）双源汇入，覆盖线程拼进 RawInput。
     pub mouse_events: Vec<egui::Event>,
-    /// 主线程 → 覆盖线程：键盘事件转发。GPU 路径下键盘只到主窗口 egui
-    /// ctx，覆盖层 ctx 收不到——当覆盖层有焦点控件（TextEdit）时，主线程
-    /// handle_shortcuts 把 Event::Key/Event::Text 取出经桥转发，覆盖线程
-    /// 拼进 RawInput（与 mouse_events 同构：主线程写、覆盖线程消费清空）。
-    pub key_events: Vec<egui::Event>,
     /// 宿主客户区原点在覆盖层逻辑坐标系中的偏移（= video_rect.min −
     /// avail_full.min，主线程每帧写；宿主鼠标换算用）。
     pub host_offset: egui::Vec2,
@@ -465,9 +518,6 @@ pub struct OverlayBridge {
     pub config_flush_request: bool,
     /// R20B：覆盖线程导出的最终配置（主线程 on_exit 读取后保存）。
     pub config_flush_result: Option<DanmakuConfig>,
-    /// R19：覆盖层 egui ctx 有焦点控件（TextEdit 等）——主线程据此跳过
-    /// 播放器快捷键，避免覆盖层输入时空格暂停等误触发。
-    pub overlay_has_focus: bool,
 }
 
 impl OverlayBridge {
@@ -493,6 +543,7 @@ impl OverlayBridge {
                 delay_seconds: 0.0,
                 gradient: cfg.gradient,
                 gradient_inset: f64::from(cfg.gradient_inset),
+                halo: f64::from(cfg.halo),
             },
             danmaku_cfg: cfg,
             run_state_hold: false,
@@ -504,7 +555,6 @@ impl OverlayBridge {
             close_track_menu: false,
             osc_wake: false,
             mouse_events: Vec::new(),
-            key_events: Vec::new(),
             host_offset: egui::Vec2::ZERO,
             owner_hwnd: 0,
             item_count: 0,
@@ -514,7 +564,6 @@ impl OverlayBridge {
             frame_counter: 0,
             config_flush_request: false,
             config_flush_result: None,
-            overlay_has_focus: false,
         }
     }
 }
@@ -579,11 +628,11 @@ impl Drop for OverlayHandle {
 /// 覆盖线程主体：raw Win32 窗口 + wgpu + egui_wgpu + DanmakuOverlay。
 /// winit 不可用（进程唯一 EventLoop 已被 eframe 占用），消息循环自管。
 fn overlay_main(bridge: Arc<Mutex<OverlayBridge>>, stop: Arc<AtomicBool>) {
-    let (cfg0, rect0, visible0) = {
+    let (cfg0, rect0) = {
         let b = lock_bridge(&bridge);
-        (b.danmaku_cfg.clone(), b.screen_rect_px, b.visible)
+        (b.danmaku_cfg.clone(), b.screen_rect_px)
     };
-    let hwnd = match create_overlay_window(rect0, visible0) {
+    let hwnd = match create_overlay_window(rect0) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!("弹幕覆盖窗口创建失败: {e}");
@@ -620,7 +669,8 @@ fn overlay_main(bridge: Arc<Mutex<OverlayBridge>>, stop: Arc<AtomicBool>) {
         applied_cfg_version: 0,
         applied_owner: 0,
         last_rect_px: rect0,
-        last_visible: Some(visible0),
+        // 隐藏创建：首帧 render 经 show_window(SW_SHOWNOACTIVATE) 显示。
+        last_visible: None,
         start: Instant::now(),
         frame_count: 0,
         last_fps_sample: Instant::now(),
@@ -777,6 +827,7 @@ impl OverlayState {
             self.danmaku.delay_seconds = run_state.delay_seconds;
             self.danmaku.gradient_cfg = run_state.gradient;
             self.danmaku.gradient_inset_cfg = run_state.gradient_inset;
+            self.danmaku.halo_cfg = run_state.halo;
         }
 
         // ---- 配置热同步（布局项）----
@@ -890,14 +941,11 @@ impl OverlayState {
             let b = lock_bridge(&self.bridge);
             b.host_offset
         };
-        let mut events = take_mouse_events(ppp, host_offset);
+        let mut events = take_mouse_events(ppp, host_offset, self.hwnd);
         {
             let mut b = lock_bridge(&self.bridge);
             if !b.mouse_events.is_empty() {
                 events.append(&mut b.mouse_events);
-            }
-            if !b.key_events.is_empty() {
-                events.append(&mut b.key_events);
             }
         }
 
@@ -966,8 +1014,6 @@ impl OverlayState {
             osc_cmds.push(crate::osc_state::OscCmd::BindDanmakuFile(xml));
         }
         let mut output = self.gpu.ctx.end_pass();
-        // R19：检查覆盖层焦点状态（主线程据此跳过播放器快捷键）。
-        let overlay_has_focus = self.gpu.ctx.memory(|m| m.focused().is_some());
         let clipped = self.gpu.ctx.tessellate(output.shapes, ppp);
         let screen_desc = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [w, h],
@@ -994,7 +1040,6 @@ impl OverlayState {
                 if !osc_cmds.is_empty() {
                     b.osc_cmds.extend(osc_cmds);
                 }
-                b.overlay_has_focus = overlay_has_focus;
                 b.osc_btn_rect = self.osc_ui.danmaku_btn_rect;
                 if settings_was_open && !self.danmaku.settings_open {
                     b.run_state = OverlayRunState {
@@ -1005,6 +1050,7 @@ impl OverlayState {
                         delay_seconds: self.danmaku.delay_seconds,
                         gradient: self.danmaku.gradient_cfg,
                         gradient_inset: self.danmaku.gradient_inset_cfg,
+                        halo: self.danmaku.halo_cfg,
                     };
                     b.run_state_hold = true;
                     b.danmaku_delay = Some(self.danmaku.delay_seconds);
@@ -1106,7 +1152,7 @@ unsafe fn get_module_handle() -> usize {
     unsafe { GetModuleHandleW(std::ptr::null()) }
 }
 
-fn create_overlay_window(rect: [i32; 4], visible: bool) -> anyhow::Result<usize> {
+fn create_overlay_window(rect: [i32; 4]) -> anyhow::Result<usize> {
     use std::sync::OnceLock;
     static ONCE: OnceLock<bool> = OnceLock::new();
     let registered = *ONCE.get_or_init(|| unsafe {
@@ -1135,7 +1181,9 @@ fn create_overlay_window(rect: [i32; 4], visible: bool) -> anyhow::Result<usize>
     let class_name = wide(CLASS_NAME);
     let title = wide("DyPlayer danmaku overlay");
     let (w, h) = ((rect[2] - rect[0]).max(1), (rect[3] - rect[1]).max(1));
-    let style = if visible { WS_POPUP | WS_VISIBLE } else { WS_POPUP };
+    // 恒隐藏创建：WS_VISIBLE 创建期会激活窗口（启动竞态抢焦点入口之一，
+    // 2026-11-13 hook 实测）；显示统一走首帧 show_window(SW_SHOWNOACTIVATE)。
+    let style = WS_POPUP;
     // NOREDIRECTIONBITMAP：无 DWM 重定向 surface（透明 DComp 窗口的标准
     // 形态——与 winit with_transparent 同款），swapchain 必须 DxgiFromVisual。
     // **不带 WS_EX_LAYERED**：layered 窗口的 hit test 按像素 alpha 穿透

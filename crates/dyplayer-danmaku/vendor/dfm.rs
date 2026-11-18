@@ -25,7 +25,7 @@ use crate::dfm_core::{
     retainer::{DanmakuRetainer, GRATING},
 };
 use crate::normalize::{DyStyle, SpecialData};
-use crate::outline::{raster_radius, resolve_width_px};
+use crate::outline::{ceil_radius, resolve_width_px};
 use std::hash::{Hash, Hasher};
 
 const STATIC_DURATION_MS: i64 = 3800;
@@ -159,10 +159,11 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
             );
             item.alpha = (raw.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
             if raw.paint_width > 0.0 && raw.paint_height > 0.0 {
-                // R15：用每条实际字号算描边外扩（raster_radius 取整后 ≥ 渲染
+                // R15：用每条实际字号算描边外扩（分数半径 ceil 后 ≥ 渲染
                 // 半径），保证碰撞边界包住真实像素外包围框。旧代码用全局
                 // 基准字号算 outline_px，混合源字号下碰撞边界可能不足。
-                let per_r = raster_radius(resolve_width_px(raw.font_size, outline_width)) as f32;
+                let per_r =
+                    ceil_radius(resolve_width_px(raw.font_size, outline_width)) as f32;
                 item.paint_width = raw.paint_width as f32 + per_r * 2.0;
                 item.paint_height = raw.paint_height as f32;
                 if item.danmaku_type.is_scroll() {

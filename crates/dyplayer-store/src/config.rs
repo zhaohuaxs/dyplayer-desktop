@@ -94,6 +94,17 @@ pub enum DanmakuFontChoice {
     Default,
 }
 
+/// 弹幕字重（原生字面两档）：normal = 字体选择的基础字面；bold = 粗体
+/// 字面链（系统 msyhbd / 包内 HarmonyOS Bold，缺失沿链回退基础字面）。
+/// 模拟加粗（mask 膨胀）因糊字已移除，字重只走原生字面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DanmakuWeight {
+    #[default]
+    Normal,
+    Bold,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PlayerConfig {
@@ -142,13 +153,17 @@ pub struct DanmakuConfig {
     pub display_area: f32,
     pub speed: f32,
     pub font: DanmakuFontChoice,
+    /// 字重（原生字面两档；布局项——宽度参与碰撞，字体热切换重排）。
+    pub weight: DanmakuWeight,
     /// dy 扩展渐变开关（弹幕 s 属性渐变；默认关）。
     pub gradient: bool,
     /// 渐变端点对称收缩量（0-0.25）：start = inset、end = 1 - inset，
     /// 0 = 全区间（现状）；渲染参数即时生效。
     pub gradient_inset: f32,
-    /// 描边宽度 profile（0-4；0 = 无描边）。
+    /// 描边宽度值（0-4 连续；0 = 无描边）。
     pub outline_width: f32,
+    /// 描边外柔晕强度（0-1；0 = off；渲染参数即时生效）。
+    pub halo: f32,
     /// 顶部弹幕（FixTop）显示开关（查询侧过滤即时生效）。
     pub show_top: bool,
     /// 底部弹幕（FixBottom）显示开关（查询侧过滤即时生效）。
@@ -164,9 +179,11 @@ impl Default for DanmakuConfig {
             display_area: 1.0,
             speed: 1.0,
             font: DanmakuFontChoice::Default,
+            weight: DanmakuWeight::Normal,
             gradient: false,
             gradient_inset: 0.0,
-            outline_width: 2.0,
+            outline_width: 2.25,
+            halo: 0.0,
             show_top: true,
             show_bottom: true,
         }
@@ -637,6 +654,7 @@ accent = 1
         let parsed: DanmakuConfig = toml::from_str("enabled = false").unwrap();
         assert!(parsed.show_top);
         assert!(parsed.show_bottom);
+        assert_eq!(parsed.weight, DanmakuWeight::Normal);
         // 已移除的选项（yahei/simhei）：#[serde(other)] 回退 Default，
         // 不因未知值导致整份 config.toml 加载失败。
         for legacy in ["yahei", "simhei"] {
@@ -657,6 +675,17 @@ accent = 1
         let text = toml::to_string(&cfg).unwrap();
         let parsed: DanmakuConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.font, cfg.font);
+        let cfg = DanmakuConfig {
+            weight: DanmakuWeight::Bold,
+            ..Default::default()
+        };
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            text.contains(r#"weight = "bold""#),
+            "expected weight = \"bold\" in {text}"
+        );
+        let parsed: DanmakuConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.weight, DanmakuWeight::Bold);
     }
 
     #[test]

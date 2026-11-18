@@ -5,7 +5,7 @@ pub mod db;
 pub mod secrets;
 
 pub use config::{
-    AppConfig, DanmakuConfig, DanmakuFontChoice, EngineConfig, FontChoice, PlayerConfig,
-    StartupView, ThemeMode, UiConfig,
+    AppConfig, DanmakuConfig, DanmakuFontChoice, DanmakuWeight, EngineConfig, FontChoice,
+    PlayerConfig, StartupView, ThemeMode, UiConfig,
 };
 pub use db::{FavoriteEntry, IndexHit, MediaLibEntry, PlayRecord, RecentEntry, Store, TrackKind};

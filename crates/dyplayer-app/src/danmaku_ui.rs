@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use dyplayer_danmaku::dfm::FrameItem;
 use dyplayer_danmaku::dfm_core::model::DanmakuType;
@@ -55,8 +56,13 @@ pub struct DanmakuOverlay {
     pub show_bottom_cfg: bool,
     /// 描边宽度 profile（0-4；布局项——宽度参与碰撞测量，异步重 prepare）。
     outline_cfg: f64,
+    /// 描边外柔晕强度（0-1；即时项：渲染参数本帧生效）。
+    /// pub(crate)：M2 覆盖窗口线程经 OverlayRunState 每帧同步。
+    pub(crate) halo_cfg: f64,
     /// 弹幕字体选择（默认 / 包内 HarmonyOS / 自定义字体文件）。
     font_choice_cfg: dyplayer_store::DanmakuFontChoice,
+    /// 弹幕字重（原生字面两档；字体加载项，热切换同字体选择路径）。
+    weight_cfg: dyplayer_store::DanmakuWeight,
     /// 会话内记忆的自定义字体路径（rfd 选择成功后更新；切默认/应用自带
     /// 不清空，供"自定义"pill 切回；启动时从 config.font == Custom 恢复）。
     pub(crate) custom_font_path: Option<PathBuf>,
@@ -86,6 +92,8 @@ pub struct DanmakuOverlay {
     pub last_visible: usize,
     /// R12-B1：后台 XML 读取+解析任务（on_file_loaded 异步化）。
     pending_xml_load: Option<mpsc::Receiver<XmlLoadResult>>,
+    /// 性能探针帧计数（每 60 帧输出一次 mesh 构建耗时）。
+    probe_frame: u64,
 }
 
 impl Default for DanmakuOverlay {
@@ -104,7 +112,8 @@ const DEFAULT_AREA: f64 = 1.0;
 const DEFAULT_SPEED: f64 = 1.0;
 const DEFAULT_GRADIENT: bool = false;
 const DEFAULT_GRADIENT_INSET: f64 = 0.0;
-const DEFAULT_OUTLINE: f64 = 2.0;
+const DEFAULT_OUTLINE: f64 = 2.25;
+const DEFAULT_HALO: f64 = 0.0;
 const DEFAULT_SHOW_TOP: bool = true;
 const DEFAULT_SHOW_BOTTOM: bool = true;
 
@@ -123,7 +132,9 @@ impl DanmakuOverlay {
             show_top_cfg: DEFAULT_SHOW_TOP,
             show_bottom_cfg: DEFAULT_SHOW_BOTTOM,
             outline_cfg: DEFAULT_OUTLINE,
+            halo_cfg: DEFAULT_HALO,
             font_choice_cfg: dyplayer_store::DanmakuFontChoice::Default,
+            weight_cfg: dyplayer_store::DanmakuWeight::Normal,
             custom_font_path: None,
             pending_font_pick: false,
             defer_file_dialogs: false,
@@ -138,6 +149,7 @@ impl DanmakuOverlay {
             last_load_result: None,
             last_visible: 0,
             pending_xml_load: None,
+            probe_frame: 0,
         }
     }
 
@@ -154,9 +166,15 @@ impl DanmakuOverlay {
         self.show_top_cfg = cfg.show_top;
         self.show_bottom_cfg = cfg.show_bottom;
         self.outline_cfg = f64::from(cfg.outline_width);
+        self.halo_cfg = f64::from(cfg.halo);
+        let font_changed = self.font_choice_cfg != cfg.font || self.weight_cfg != cfg.weight;
         self.font_choice_cfg = cfg.font.clone();
+        self.weight_cfg = cfg.weight;
         if let dyplayer_store::DanmakuFontChoice::Custom(path) = &self.font_choice_cfg {
             self.custom_font_path = Some(PathBuf::from(path));
+        }
+        if font_changed {
+            self.reload_font();
         }
     }
 
@@ -173,7 +191,9 @@ impl DanmakuOverlay {
             show_top: self.show_top_cfg,
             show_bottom: self.show_bottom_cfg,
             outline_width: self.outline_cfg as f32,
+            halo: self.halo_cfg as f32,
             font: self.font_choice_cfg.clone(),
+            weight: self.weight_cfg,
         }
     }
 
@@ -311,7 +331,7 @@ impl DanmakuOverlay {
         if self.session.is_some() || self.font_unavailable {
             return;
         }
-        match DanmakuFont::from_paths(&font_candidates(&self.font_choice_cfg)) {
+        match DanmakuFont::from_paths(&font_candidates(&self.font_choice_cfg, self.weight_cfg)) {
             Some(font) => {
                 let mut params = LayoutParams {
                     base_font_size: self.font_size_cfg,
@@ -386,8 +406,22 @@ impl DanmakuOverlay {
             texture_id,
             gradient_enabled: self.gradient_cfg,
             gradient_inset: self.gradient_inset_cfg as f32,
+            halo: self.halo_cfg as f32,
         };
-        let mesh = build_danmaku_mesh(&mut self.atlas, &params, &visible);
+        let mesh = {
+            let t0 = Instant::now();
+            let m = build_danmaku_mesh(&mut self.atlas, &params, &visible);
+            let dt = t0.elapsed().as_secs_f64() * 1000.0;
+            self.probe_frame += 1;
+            if self.probe_frame.is_multiple_of(60) {
+                tracing::info!(
+                    "danmaku_probe mesh_build_ms={:.2} visible={}",
+                    dt,
+                    visible.len(),
+                );
+            }
+            m
+        };
         Self::ensure_texture(&mut self.atlas, &mut self.tex, ui.ctx());
         ui.painter().add(egui::Shape::Mesh(Arc::new(mesh)));
     }
@@ -450,6 +484,16 @@ impl DanmakuOverlay {
     /// 字体（warn；选择已记录，下次 ensure_session / 重启重试）。
     pub fn set_font_choice(&mut self, choice: dyplayer_store::DanmakuFontChoice) {
         self.font_choice_cfg = choice;
+        self.reload_font();
+    }
+
+    /// 字重热切换（原生字面两档）：与字体选择同路径（atlas 重建 + 异步重排）。
+    fn set_weight(&mut self, weight: dyplayer_store::DanmakuWeight) {
+        self.weight_cfg = weight;
+        self.reload_font();
+    }
+
+    fn reload_font(&mut self) {
         if self.session.is_none() {
             // session 未建立：重置不可用标记，下次 file-loaded 按新选择重试。
             // R13：无 session 时换字体也须清图集——旧字形会命中新 session。
@@ -458,10 +502,13 @@ impl DanmakuOverlay {
             self.tex = None;
             return;
         }
-        let Some(font) = DanmakuFont::from_paths(&font_candidates(&self.font_choice_cfg)) else {
+        let Some(font) =
+            DanmakuFont::from_paths(&font_candidates(&self.font_choice_cfg, self.weight_cfg))
+        else {
             tracing::warn!(
-                "danmaku font {:?} unavailable, keep current font",
-                self.font_choice_cfg
+                "danmaku font {:?} weight {:?} unavailable, keep current font",
+                self.font_choice_cfg,
+                self.weight_cfg
             );
             return;
         };
@@ -506,13 +553,23 @@ impl DanmakuOverlay {
             || outside.secondary_clicked()
             || lui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
 
-        // 固定尺寸卡片：内容行高全固定，结果反馈行按需增高（弹幕文件
-        // 载入结果与字体选择结果各一行）。字体选择行 +33（26 行高 + 7 间距）、
-        // 描边滑条 +33、渐变 check +40（7 + 26 + 7）。
+        // 卡片高度自适应（播放队列同族工艺）：内容行高全固定，结果反馈行
+        // 按需增高；超屏幕/锚点上限时 body 走 ScrollArea 滚动。
+        const CARD_OVERHEAD: f32 = 18.0 + 26.0 + 6.0 + 18.0;
+        // body 固定行高合计：enabled 26+6 + 7 滑条×47 + 渐变 7+26+7
+        // + 字体 26 + 字重 7+26 + 分隔 7+1+7 + 底行 30。
+        const BODY_H: f32 = 505.0;
         let result_extra = if self.last_load_result.is_some() { 22.0 } else { 0.0 }
             + if self.last_font_result.is_some() { 22.0 } else { 0.0 };
-        let size = egui::vec2(300.0, 486.0 + result_extra);
+        let max_by_screen = if let Some(a) = anchor {
+            (a.y - screen.top() - CARD_OVERHEAD - 8.0).max(160.0)
+        } else {
+            screen.height() - 24.0 - CARD_OVERHEAD
+        };
+        let list_h = (BODY_H + result_extra).min(max_by_screen);
+        let size = egui::vec2(300.0, CARD_OVERHEAD + list_h);
         let card = settings_card_rect(screen, anchor, size);
+        register_card_layer(lui.ctx(), layer, card);
         let p = lui.painter();
         p.rect_filled(card, egui::CornerRadius::same(14), settings_card_bg());
         p.rect_stroke(
@@ -585,8 +642,13 @@ impl DanmakuOverlay {
         }
 
         mui.add_space(6.0);
+        let mut pick_clicked = false;
+        egui::ScrollArea::vertical()
+            .id_salt("danmaku-settings-list")
+            .max_height(list_h)
+            .show_viewport(&mut mui, |mui, _| {
         draw_enabled_row(
-            &mut mui,
+            mui,
             "dm-set-enabled",
             &mut self.enabled,
             &mut self.show_top_cfg,
@@ -597,7 +659,7 @@ impl DanmakuOverlay {
 
         // 即时项：透明度 / 延迟（±10 分钟，0.5s 步进）。
         draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-opacity",
             "透明度",
             0.1,
@@ -610,7 +672,7 @@ impl DanmakuOverlay {
         );
         let mut delay = self.delay_seconds as f32;
         if draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-delay",
             "延迟",
             -600.0,
@@ -631,7 +693,7 @@ impl DanmakuOverlay {
         let mut layout_changed = false;
         let mut fs = self.font_size_cfg;
         if draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-fontsize",
             "字号",
             12.0,
@@ -647,7 +709,7 @@ impl DanmakuOverlay {
         }
         let mut area = self.display_area_cfg as f32;
         if draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-area",
             "显示区域",
             0.25,
@@ -663,7 +725,7 @@ impl DanmakuOverlay {
         }
         let mut speed = self.speed_cfg as f32;
         if draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-speed",
             "滚动速度",
             0.5,
@@ -677,11 +739,11 @@ impl DanmakuOverlay {
             self.speed_cfg = f64::from(speed);
             layout_changed = true;
         }
-        // 描边宽度（0.25 档量化：atlas glyph key 含 radius 维度，连续拖动
-        // 会堆几十档 radius 缓存；0 = 无描边）。
+        // 描边宽度（0.05 步进连续值：渲染分数半径小值即生效；atlas
+        // radius 量化 0.25px 防缓存堆积；0 = 无描边）。
         let mut outline = self.outline_cfg as f32;
         if draw_slider_row(
-            &mut mui,
+            mui,
             "dm-set-outline",
             "描边",
             0.0,
@@ -692,9 +754,27 @@ impl DanmakuOverlay {
             self.enabled,
             theme,
         ) {
-            outline = (outline / 0.25).round() * 0.25;
+            outline = (outline / 0.05).round() * 0.05;
             self.outline_cfg = f64::from(outline);
             layout_changed = true;
+        }
+        // 柔晕（0.05 档量化：即时项，渲染参数本帧生效，不重排；
+        // 依附描边遍，无描边时视觉无效果）。
+        let mut halo = self.halo_cfg as f32;
+        if draw_slider_row(
+            mui,
+            "dm-set-halo",
+            "柔晕",
+            0.0,
+            1.0,
+            DEFAULT_HALO as f32,
+            &mut halo,
+            &|v| format!("{v:.2}"),
+            self.enabled,
+            theme,
+        ) {
+            halo = (halo / 0.05).round() * 0.05;
+            self.halo_cfg = f64::from(halo);
         }
         if layout_changed {
             self.apply_params();
@@ -704,7 +784,7 @@ impl DanmakuOverlay {
         // 生效，不重排布局；关 = per-item 渐变降级默认配色，滑条禁用淡出）。
         mui.add_space(7.0);
         draw_gradient_row(
-            &mut mui,
+            mui,
             "dm-set-gradient",
             &mut self.gradient_cfg,
             &mut self.gradient_inset_cfg,
@@ -717,7 +797,7 @@ impl DanmakuOverlay {
         // "自定义"pill 无记忆路径时点击=打开文件选择；有路径时点击=切换
         // 到该字体；已选中自定义时尾部叠修改按钮（另选文件）。
         match draw_font_choice_row(
-            &mut mui,
+            mui,
             "dm-set-font",
             &self.font_choice_cfg,
             self.custom_font_path.as_deref(),
@@ -743,6 +823,22 @@ impl DanmakuOverlay {
             None => {}
         }
 
+        // 字重（原生字面两档）：自定义字体单字面，整行禁用。
+        mui.add_space(7.0);
+        if let Some(w) = draw_weight_row(
+            mui,
+            "dm-set-weight",
+            self.weight_cfg,
+            self.enabled
+                && !matches!(
+                    self.font_choice_cfg,
+                    dyplayer_store::DanmakuFontChoice::Custom(_)
+                ),
+            theme,
+        ) {
+            self.set_weight(w);
+        }
+
         mui.add_space(7.0);
         let (hr, _) = mui.allocate_exact_size(
             egui::vec2(mui.available_width(), 1.0),
@@ -756,7 +852,6 @@ impl DanmakuOverlay {
         mui.add_space(7.0);
 
         // 底行：弹幕数 + 载入入口（描边胶囊，hover 转强调）。
-        let mut pick_clicked = false;
         {
             let (rect, _) = mui.allocate_exact_size(
                 egui::vec2(mui.available_width(), 30.0),
@@ -848,6 +943,7 @@ impl DanmakuOverlay {
                 col,
             );
         }
+            });
 
         if close_now || close_x {
             self.settings_open = false;
@@ -941,6 +1037,22 @@ pub(crate) fn settings_card_rect(
     origin.x = origin.x.clamp(min_x, max_x);
     origin.y = origin.y.clamp(min_y, max_y);
     egui::Rect::from_min_size(origin, size)
+}
+
+/// 注册卡片自定义图层到 memory.areas，否则 rect_contains_pointer（wheel/滚动条 hover）恒 false。
+pub(crate) fn register_card_layer(ctx: &egui::Context, layer: egui::LayerId, rect: egui::Rect) {
+    ctx.memory_mut(|m| {
+        m.areas_mut().set_state(
+            layer,
+            egui::AreaState {
+                pivot_pos: Some(rect.min),
+                pivot: egui::Align2::LEFT_TOP,
+                size: Some(rect.size()),
+                interactable: true,
+                last_became_visible_at: None,
+            },
+        );
+    });
 }
 
 /// 滑条指针横坐标 → 值（线性映射 + 双端 clamp；退化区间返回 min）。
@@ -1102,8 +1214,13 @@ fn draw_gradient_row(
 /// Default = 不指定字体，沿系统候选链（与旧版 from_system 行为一致）；
 /// App = 包内 HarmonyOS Sans SC Medium（与 UI 主字体同源路径链）；
 /// Custom = 用户自选字体文件。任一选择失败时交叉回退系统字体，保证弹幕可用。
-fn font_candidates(choice: &dyplayer_store::DanmakuFontChoice) -> Vec<PathBuf> {
-    let mut paths = match choice {
+/// weight=Bold 时链首插粗体字面（Default→msyhbd；App→HarmonyOS Bold，
+/// 未随包全 miss 后回退 msyhbd），再沿基础链回退；Custom 单字面不插。
+fn font_candidates(
+    choice: &dyplayer_store::DanmakuFontChoice,
+    weight: dyplayer_store::DanmakuWeight,
+) -> Vec<PathBuf> {
+    let base = match choice {
         dyplayer_store::DanmakuFontChoice::Default => vec![
             PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
             PathBuf::from(r"C:\Windows\Fonts\msyh.ttf"),
@@ -1112,6 +1229,22 @@ fn font_candidates(choice: &dyplayer_store::DanmakuFontChoice) -> Vec<PathBuf> {
         ],
         dyplayer_store::DanmakuFontChoice::App => crate::player_app::harmonyos_font_candidates(),
         dyplayer_store::DanmakuFontChoice::Custom(path) => vec![PathBuf::from(path)],
+    };
+    let mut paths = if weight == dyplayer_store::DanmakuWeight::Bold
+        && !matches!(choice, dyplayer_store::DanmakuFontChoice::Custom(_))
+    {
+        let mut bold = match choice {
+            dyplayer_store::DanmakuFontChoice::App => {
+                crate::player_app::harmonyos_bold_font_candidates()
+            }
+            _ => Vec::new(),
+        };
+        bold.push(PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttc"));
+        bold.push(PathBuf::from(r"C:\Windows\Fonts\msyhbd.ttf"));
+        bold.extend(base);
+        bold
+    } else {
+        base
     };
     for fallback in [
         r"C:\Windows\Fonts\msyh.ttc",
@@ -1330,6 +1463,64 @@ fn draw_pill_text_c(p: &egui::Painter, pill: egui::Rect, text: &str, selected: b
         gal,
         tc,
     );
+}
+
+/// 字重行：左"字重"标签 + 标准/加粗两 pill（原生字面两档，pill 同工艺）。
+/// 自定义字体单字面时调用方传 enabled=false 整行淡出不响应。
+fn draw_weight_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: dyplayer_store::DanmakuWeight,
+    enabled: bool,
+    theme: OscTheme,
+) -> Option<dyplayer_store::DanmakuWeight> {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::hover());
+    let p = ui.painter();
+    let top = rect.center().y - 11.0;
+    let pill_h = 22.0;
+    let gap = 6.0;
+    let lc = if enabled {
+        theme.text_dim
+    } else {
+        fade(theme.text_dim, 0.35)
+    };
+    p.text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        "字重",
+        osc_font(12.5),
+        lc,
+    );
+    let pills_left = rect.left() + 34.0;
+    let mut action = None;
+    for (i, (weight, label)) in [
+        (dyplayer_store::DanmakuWeight::Normal, "标准"),
+        (dyplayer_store::DanmakuWeight::Bold, "加粗"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(pills_left + (46.0 + gap) * i as f32, top),
+            egui::vec2(46.0, pill_h),
+        );
+        let selected = current == weight;
+        let resp = draw_pill_bg(
+            ui,
+            p,
+            pill,
+            egui::Id::unique(id).with(i),
+            selected,
+            enabled,
+            theme,
+        );
+        draw_pill_text_c(p, pill, label, selected, enabled, theme);
+        if enabled && resp.clicked() && !selected {
+            action = Some(weight);
+        }
+    }
+    action
 }
 
 /// 弹窗字体选择行：左"字体"标签 + 默认 / 应用自带（固定窄 pill）+
@@ -1789,6 +1980,7 @@ mod tests {
         // 可用性判断与 ensure_session 同口径（默认选择的候选链）。
         if DanmakuFont::from_paths(&font_candidates(
             &dyplayer_store::DanmakuFontChoice::Default,
+            dyplayer_store::DanmakuWeight::Normal,
         ))
         .is_some()
         {
@@ -1830,9 +2022,11 @@ mod tests {
         assert_eq!(cfg.display_area as f64, DEFAULT_AREA);
         assert_eq!(cfg.speed as f64, DEFAULT_SPEED);
         assert_eq!(cfg.font, dyplayer_store::DanmakuFontChoice::Default);
+        assert_eq!(cfg.weight, dyplayer_store::DanmakuWeight::Normal);
         assert_eq!(cfg.gradient, DEFAULT_GRADIENT);
         assert_eq!(cfg.gradient_inset as f64, DEFAULT_GRADIENT_INSET);
         assert_eq!(cfg.outline_width as f64, DEFAULT_OUTLINE);
+        assert_eq!(cfg.halo as f64, DEFAULT_HALO);
         assert_eq!(cfg.show_top, DEFAULT_SHOW_TOP);
         assert_eq!(cfg.show_bottom, DEFAULT_SHOW_BOTTOM);
     }
@@ -1847,9 +2041,11 @@ mod tests {
             display_area: 0.25,
             speed: 2.0,
             font: dyplayer_store::DanmakuFontChoice::Custom("C:\\Fonts\\my.ttf".into()),
+            weight: dyplayer_store::DanmakuWeight::Bold,
             gradient: true,
             gradient_inset: 0.25,
             outline_width: 3.5,
+            halo: 0.5,
             show_top: false,
             show_bottom: true,
         };
@@ -1862,6 +2058,7 @@ mod tests {
         assert!(overlay.gradient_cfg);
         assert_eq!(overlay.gradient_inset_cfg, 0.25);
         assert_eq!(overlay.outline_cfg, 3.5);
+        assert_eq!(overlay.halo_cfg, 0.5);
         assert!(!overlay.show_top_cfg);
         assert!(overlay.show_bottom_cfg);
         assert_eq!(
@@ -1873,6 +2070,7 @@ mod tests {
             overlay.custom_font_path.as_deref(),
             Some(Path::new(r"C:\Fonts\my.ttf"))
         );
+        assert_eq!(overlay.weight_cfg, dyplayer_store::DanmakuWeight::Bold);
         let out = overlay.export_config();
         assert!(!out.enabled);
         assert_eq!(out.opacity, 0.4);
@@ -1882,12 +2080,14 @@ mod tests {
         assert!(out.gradient);
         assert_eq!(out.gradient_inset, 0.25);
         assert_eq!(out.outline_width, 3.5);
+        assert_eq!(out.halo, 0.5);
         assert!(!out.show_top);
         assert!(out.show_bottom);
         assert_eq!(
             out.font,
             dyplayer_store::DanmakuFontChoice::Custom("C:\\Fonts\\my.ttf".into())
         );
+        assert_eq!(out.weight, dyplayer_store::DanmakuWeight::Bold);
     }
 
     #[test]
@@ -1949,6 +2149,7 @@ mod tests {
         let mut overlay = DanmakuOverlay::new();
         if DanmakuFont::from_paths(&font_candidates(
             &dyplayer_store::DanmakuFontChoice::Default,
+            dyplayer_store::DanmakuWeight::Normal,
         ))
         .is_some()
         {
@@ -1967,6 +2168,7 @@ mod tests {
         let mut overlay = DanmakuOverlay::new();
         if DanmakuFont::from_paths(&font_candidates(
             &dyplayer_store::DanmakuFontChoice::Default,
+            dyplayer_store::DanmakuWeight::Normal,
         ))
         .is_none()
         {
@@ -2024,32 +2226,64 @@ mod tests {
         assert_eq!(o.gradient_cfg, DEFAULT_GRADIENT);
         assert_eq!(o.gradient_inset_cfg, DEFAULT_GRADIENT_INSET);
         assert_eq!(o.outline_cfg, DEFAULT_OUTLINE);
+        assert_eq!(o.halo_cfg, DEFAULT_HALO);
         assert_eq!(o.font_choice_cfg, dyplayer_store::DanmakuFontChoice::Default);
+        assert_eq!(o.weight_cfg, dyplayer_store::DanmakuWeight::Normal);
         assert!(o.custom_font_path.is_none());
     }
 
     #[test]
     fn font_candidates_start_with_choice_and_fall_back() {
+        let normal = dyplayer_store::DanmakuWeight::Normal;
         // Default：不指定字体，链 = 系统候选链（与旧版 from_system 一致）。
-        let default = font_candidates(&dyplayer_store::DanmakuFontChoice::Default);
+        let default = font_candidates(&dyplayer_store::DanmakuFontChoice::Default, normal);
         assert!(default.first().is_some_and(|p| p.ends_with("msyh.ttc")));
         assert!(default.iter().any(|p| p.ends_with("simhei.ttf")));
         assert!(default.iter().any(|p| p.ends_with("simsun.ttc")));
         // App：链首 = HarmonyOS 候选（与 UI 主字体同源），后接系统回退。
-        let app = font_candidates(&dyplayer_store::DanmakuFontChoice::App);
+        let app = font_candidates(&dyplayer_store::DanmakuFontChoice::App, normal);
         assert!(
             app.first().is_some_and(|p| p.to_string_lossy().contains("HarmonyOS")),
             "App chain must lead with HarmonyOS candidates, got {app:?}"
         );
         assert!(app.iter().any(|p| p.ends_with("msyh.ttc")));
         // Custom：链首 = 用户文件，交叉回退兜底（文件被删不判死）。
-        let custom = font_candidates(&dyplayer_store::DanmakuFontChoice::Custom(
-            "C:\\My\\font.ttf".into(),
-        ));
+        let custom = font_candidates(
+            &dyplayer_store::DanmakuFontChoice::Custom("C:\\My\\font.ttf".into()),
+            normal,
+        );
         assert!(custom.first().is_some_and(|p| p == &PathBuf::from("C:\\My\\font.ttf")));
         assert!(custom.iter().any(|p| p.ends_with("msyh.ttc")));
         // 无重复路径。
         for chain in [default, app, custom] {
+            let mut seen = std::collections::HashSet::new();
+            assert!(chain.iter().all(|p| seen.insert(p.clone())));
+        }
+    }
+
+    #[test]
+    fn font_candidates_bold_leads_with_bold_face_and_falls_back() {
+        let bold = dyplayer_store::DanmakuWeight::Bold;
+        // Default 加粗：链首 msyhbd，缺失沿基础链回退。
+        let default = font_candidates(&dyplayer_store::DanmakuFontChoice::Default, bold);
+        assert!(default.first().is_some_and(|p| p.ends_with("msyhbd.ttc")));
+        assert!(default.iter().any(|p| p.ends_with("msyh.ttc")));
+        // App 加粗：链首 HarmonyOS Bold（未随包），回退 msyhbd 再基础链。
+        let app = font_candidates(&dyplayer_store::DanmakuFontChoice::App, bold);
+        assert!(
+            app.first()
+                .is_some_and(|p| p.to_string_lossy().contains("HarmonyOS_Sans_SC_Bold")),
+            "App bold chain must lead with HarmonyOS Bold candidates, got {app:?}"
+        );
+        assert!(app.iter().any(|p| p.ends_with("msyhbd.ttc")));
+        assert!(app.iter().any(|p| p.ends_with("msyh.ttc")));
+        // Custom 单字面：加粗不改变链。
+        let choice = dyplayer_store::DanmakuFontChoice::Custom("C:\\My\\font.ttf".into());
+        assert_eq!(
+            font_candidates(&choice, bold),
+            font_candidates(&choice, dyplayer_store::DanmakuWeight::Normal)
+        );
+        for chain in [default, app] {
             let mut seen = std::collections::HashSet::new();
             assert!(chain.iter().all(|p| seen.insert(p.clone())));
         }
@@ -2090,6 +2324,7 @@ mod tests {
     fn set_font_choice_hot_swaps_active_session() {
         let font_ok = DanmakuFont::from_paths(&font_candidates(
             &dyplayer_store::DanmakuFontChoice::Default,
+            dyplayer_store::DanmakuWeight::Normal,
         ))
         .is_some();
         if !font_ok {
@@ -2110,6 +2345,12 @@ mod tests {
 
         overlay.set_font_choice(dyplayer_store::DanmakuFontChoice::Default);
         assert_eq!(overlay.font_choice_cfg, dyplayer_store::DanmakuFontChoice::Default);
+        assert!(overlay.session.is_some());
+        assert_eq!(overlay.item_count(), 1);
+
+        // 字重热切换：粗体字面链加载成功，session 沿用不丢弹幕。
+        overlay.set_weight(dyplayer_store::DanmakuWeight::Bold);
+        assert_eq!(overlay.weight_cfg, dyplayer_store::DanmakuWeight::Bold);
         assert!(overlay.session.is_some());
         assert_eq!(overlay.item_count(), 1);
         let _ = std::fs::remove_file(&xml);

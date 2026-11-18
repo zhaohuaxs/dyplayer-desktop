@@ -110,7 +110,7 @@ pub struct LayoutParams {
     pub scroll_speed_factor: f64,
     /// 轨道行距比（0.0 - 2.0）。
     pub track_gap_ratio: f64,
-    /// 描边 profile（0=off 1=fine 2=normal 3=thick）。
+    /// 描边值（0-4 连续；0=off）。
     pub outline_profile: f64,
     /// 重复弹幕合并（x N）。
     pub merge_danmaku: bool,
@@ -141,7 +141,7 @@ impl Default for LayoutParams {
             display_area: 1.0,
             scroll_speed_factor: 1.0,
             track_gap_ratio: 0.0,
-            outline_profile: 2.0,
+            outline_profile: 2.25,
             merge_danmaku: false,
             max_quantity: None,
             max_lines_per_type: None,

@@ -159,6 +159,8 @@ pub(crate) enum OscCmd {
     TakeScreenshot,
     /// 回媒体库（OSC 媒体库按钮）。
     ExitToLibrary,
+    /// 停止播放并回到空态（mpv stop + 清理播放状态，不退出播放页）。
+    Stop,
     SkipPrev,
     SkipNext,
     /// 信息块开关（config.show_stats_hud + 落盘）。

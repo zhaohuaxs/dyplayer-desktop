@@ -1098,6 +1098,34 @@ impl PlayerSession {
         }
     }
 
+    /// 停止播放并回到空态：mpv stop + 清理播放状态/弹幕/面板，
+    /// 保留 items/index（队列不变，用户可重新点击播放）。
+    pub fn stop(&mut self) {
+        self.send_command(&["stop"]);
+        self.paused = true;
+        self.duration = 0.0;
+        self.video_size = None;
+        self.chapters.clear();
+        self.cache_time = 0.0;
+        self.codec.clear();
+        self.hwdec.clear();
+        self.vo_drops = 0;
+        self.video_fps = 0.0;
+        self.audio_tracks.clear();
+        self.sub_tracks.clear();
+        self.remote_prefetch = None;
+        self.prefetch_danmaku_overridden = false;
+        self.save_danmaku_binding();
+        self.danmaku.on_media_change();
+        self.danmaku_track = None;
+        self.pending_danmaku = None;
+        self.overlay_load(crate::overlay_window::OverlayLoad::Clear);
+        self.show_queue = false;
+        self.settings_open = false;
+        self.osc_ui.track_menu = None;
+        self.status = "已停止".into();
+    }
+
     /// 三面板互斥切换：打开目标面板时关闭其余两个；目标已开则全部关闭。
     fn toggle_panel(&mut self, target: PlayerPanel) {
         let is_open = match target {
@@ -1320,6 +1348,7 @@ impl PlayerSession {
                     delay_seconds: self.danmaku.delay_seconds,
                     gradient: self.danmaku.gradient_cfg,
                     gradient_inset: self.danmaku.gradient_inset_cfg,
+                    halo: self.danmaku.halo_cfg,
                 };
             }
             if let Some((ox, oy)) = origin {
@@ -1623,6 +1652,7 @@ impl PlayerSession {
                 OscCmd::ToggleLoopFile => self.toggle_loop_file(),
                 OscCmd::TakeScreenshot => self.take_screenshot(),
                 OscCmd::ExitToLibrary => self.requested_exit = true,
+                OscCmd::Stop => self.stop(),
                 OscCmd::SkipPrev => {
                     let _ = self.advance(-1);
                 }
@@ -1772,43 +1802,14 @@ impl PlayerSession {
     /// 运行，须显式重置），事件被就地消费，避免再触发聚焦控件（空格=点击聚焦按钮）。
     /// 当前播放界面无文本输入控件；若未来加入 TextEdit，需在聚焦时让位。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // 主线程残留焦点（如从 Browse 搜索框带入）清掉。播放页主线程无
-        // TextEdit，focused() 应恒 false；若有残留则清之，不 return——
-        // 继续检测覆盖层焦点（GPU 路径 TextEdit 在覆盖层）。
+        // 主线程残留焦点（如从 Browse 搜索框带入）清掉。播放页无文本输入
+        // 控件（覆盖层亦无 TextEdit），focused() 应恒 false；若有残留则清之。
         ctx.memory_mut(|m| {
             if let Some(id) = m.focused() {
                 m.surrender_focus(id);
             }
             m.move_focus(egui::FocusDirection::None);
         });
-        // R19：GPU 覆盖层有焦点控件时抑制主线程快捷键。
-        if self.overlay.as_ref().is_some_and(|ov| {
-            ov.bridge().lock().map(|b| b.overlay_has_focus).unwrap_or(false)
-        }) {
-            // 键盘事件只到主窗口 egui ctx，覆盖层 ctx 收不到——转发
-            // Key/Text/Ime 事件经桥到覆盖线程（TextEdit 输入靠此通路）。
-            let mut key_events: Vec<egui::Event> = Vec::new();
-            ctx.input_mut(|i| {
-                i.events.retain(|e| {
-                    if matches!(
-                        e,
-                        egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Ime(_)
-                    ) {
-                        key_events.push(e.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-            });
-            if !key_events.is_empty()
-                && let Some(ov) = &self.overlay
-                && let Ok(mut b) = ov.bridge().lock()
-            {
-                b.key_events.append(&mut key_events);
-            }
-            return;
-        }
         /// 取走指定按键事件；repeat 事件一律消费以防聚焦控件响应，
         /// 但仅当 `allow_repeat` 时才触发动作（避免按住空格狂切暂停）。
         fn take_key(i: &mut egui::InputState, key: egui::Key, allow_repeat: bool) -> bool {
@@ -2607,6 +2608,7 @@ impl PlayerSession {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ui_start = Instant::now();
         self.set_phase(PH_UI_START);
         self.maybe_enter_fullscreen(frame, ui.ctx());
         self.maybe_attach_host(frame);
@@ -2935,6 +2937,15 @@ impl PlayerSession {
         }
 
         self.set_phase(PH_UI_END);
+        if self.ui_tick.is_multiple_of(60) {
+            let frame_ms = ui_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                "frame_probe ui_ms={:.2} dm_visible={} gpu_wid={}",
+                frame_ms,
+                self.danmaku.last_visible,
+                self.gpu_wid,
+            );
+        }
         // 暂停/空闲兜底：mpv 不产帧唤醒时保持低频心跳（HUD 隐藏等得以生效）；
         // SW 播放中由 mpv display 配速的 update callback 以屏幕刷新率驱动满帧。
         // GPU wid 路径无 update callback：播放中按屏幕刷新率心跳驱动 eframe
@@ -3554,18 +3565,22 @@ pub fn install_cjk_font(ctx: &egui::Context, choice: &dyplayer_store::FontChoice
 ///
 /// pub(crate)：弹幕 overlay 的字体选择（App 选项）复用同一路径链。
 pub(crate) fn harmonyos_font_candidates() -> Vec<PathBuf> {
-    let manifest = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fonts/HarmonyOS_Sans_SC_Medium.ttf"
-    ));
-    let mut candidates = vec![
-        manifest,
-        PathBuf::from("fonts").join("HarmonyOS_Sans_SC_Medium.ttf"),
-    ];
+    harmonyos_candidates("HarmonyOS_Sans_SC_Medium.ttf")
+}
+
+/// HarmonyOS Sans SC Bold 候选链（与 Medium 同三档布局）。当前未随包：
+/// 全 miss，由调用方沿链回退系统粗体字面（补包留后续）。
+pub(crate) fn harmonyos_bold_font_candidates() -> Vec<PathBuf> {
+    harmonyos_candidates("HarmonyOS_Sans_SC_Bold.ttf")
+}
+
+fn harmonyos_candidates(file: &str) -> Vec<PathBuf> {
+    let manifest = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fonts/")).join(file);
+    let mut candidates = vec![manifest, PathBuf::from("fonts").join(file)];
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("fonts").join("HarmonyOS_Sans_SC_Medium.ttf"));
+        candidates.push(dir.join("fonts").join(file));
     }
     candidates
 }

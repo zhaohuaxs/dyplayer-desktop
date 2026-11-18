@@ -15,7 +15,7 @@
 //! 指针位于底部/顶部条带、弹层或面板打开、seek 拖拽中、暂停时保持显示。
 
 use super::*;
-use crate::glyph::{fade, mix, paint_left_center_truncated, truncate_tail};
+use crate::glyph::{fade, mix, paint_glyph, paint_left_center_truncated, truncate_tail, Glyph};
 use crate::osc_state::{OscCmd, OscLayout, OscNibble, OscState, OscUiState, TrackMenuKind};
 use dyplayer_mpv::Track;
 use egui::{
@@ -397,7 +397,7 @@ fn draw_controls(
     }
     volume_control(st, ui, theme, alpha, pos2(lx + 8.0, cy), cmds);
 
-    // 中组：上一集 / 快退 / 播放暂停 / 快进 / 下一集（边界集禁用置灰）。
+    // 中组：上一集 / 快退 / 停止 / 播放暂停 / 快进 / 下一集（边界集禁用置灰）。
     let play_glyph = if st.paused {
         icons::PLAY
     } else {
@@ -407,12 +407,13 @@ fn draw_controls(
     let step_fwd = st.seek_step_fwd;
     let can_prev = st.can_prev;
     let can_next = st.can_next;
-    let mid: [(char, f32); 5] = [
-        (icons::SKIP_PREV, 23.0),
-        (icons::REPLAY_10, 23.0),
-        (play_glyph, 30.0),
-        (icons::FORWARD_10, 23.0),
-        (icons::SKIP_NEXT, 23.0),
+    let mid: [(Option<char>, f32); 6] = [
+        (Some(icons::SKIP_PREV), 23.0),
+        (Some(icons::REPLAY_10), 23.0),
+        (None, 23.0),
+        (Some(play_glyph), 30.0),
+        (Some(icons::FORWARD_10), 23.0),
+        (Some(icons::SKIP_NEXT), 23.0),
     ];
     let gap = 10.0;
     let widths: Vec<f32> = mid.iter().map(|it| it.1 + 10.0).collect();
@@ -430,8 +431,9 @@ fn draw_controls(
                 },
             ),
             1 => (true, format!("后退 {step_back}s")),
-            2 => (true, "播放 / 暂停".into()),
-            3 => (true, format!("前进 {step_fwd}s")),
+            2 => (true, "停止".into()),
+            3 => (true, "播放 / 暂停".into()),
+            4 => (true, format!("前进 {step_fwd}s")),
             _ => (
                 can_next,
                 if can_next {
@@ -441,24 +443,39 @@ fn draw_controls(
                 },
             ),
         };
-        let resp = icon_button_at(
-            ui,
-            Id::unique("player-osc-mid").with(i),
-            *glyph,
-            *sz,
-            center,
-            theme,
-            alpha,
-            enabled,
-            hover_fx(st),
-            &tip,
-        );
+        let resp = match glyph {
+            Some(ch) => icon_button_at(
+                ui,
+                Id::unique("player-osc-mid").with(i),
+                *ch,
+                *sz,
+                center,
+                theme,
+                alpha,
+                enabled,
+                hover_fx(st),
+                &tip,
+            ),
+            None => glyph_button_at(
+                ui,
+                Id::unique("player-osc-mid").with(i),
+                Glyph::Stop,
+                *sz,
+                center,
+                theme,
+                alpha,
+                enabled,
+                hover_fx(st),
+                &tip,
+            ),
+        };
         if resp.clicked() && enabled {
             match i {
                 0 => cmds.push(OscCmd::SkipPrev),
                 1 => cmds.push(OscCmd::SeekRel(-step_back)),
-                2 => cmds.push(OscCmd::TogglePause),
-                3 => cmds.push(OscCmd::SeekRel(step_fwd)),
+                2 => cmds.push(OscCmd::Stop),
+                3 => cmds.push(OscCmd::TogglePause),
+                4 => cmds.push(OscCmd::SeekRel(step_fwd)),
                 _ => cmds.push(OscCmd::SkipNext),
             }
         }
@@ -586,7 +603,9 @@ fn track_menu_card(
     theme: OscTheme,
     cmds: &mut Vec<OscCmd>,
 ) {
-    use crate::danmaku_ui::{settings_card_bg, settings_card_outline, settings_card_rect};
+    use crate::danmaku_ui::{
+        register_card_layer, settings_card_bg, settings_card_outline, settings_card_rect,
+    };
 
     let screen = ui.max_rect();
     let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("osc-track-menu"));
@@ -613,6 +632,7 @@ fn track_menu_card(
     let list_h = ((tracks.len() as f32 + 1.0) * ROW_H).min(ROW_H * 9.0);
     let size = vec2(280.0, 18.0 + 26.0 + 6.0 + list_h + 7.0 + 1.0 + 7.0 + 30.0 + 18.0);
     let card = settings_card_rect(screen, Some(anchor), size);
+    register_card_layer(lui.ctx(), layer, card);
     let p = lui.painter();
     p.rect_filled(card, CornerRadius::same(14), settings_card_bg());
     p.rect_stroke(
@@ -910,6 +930,51 @@ fn icon_button_at(
         osc_font(s),
         fade(color, eff_alpha),
     );
+    if resp.hovered() && !tooltip.is_empty() {
+        paint_tooltip(ui, pos2(center.x, rect.top() - 2.0), tooltip, 1.0);
+    }
+    resp
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glyph_button_at(
+    ui: &mut Ui,
+    id: Id,
+    glyph: Glyph,
+    size: f32,
+    center: Pos2,
+    theme: OscTheme,
+    alpha: f32,
+    enabled: bool,
+    fx: HoverFx,
+    tooltip: &str,
+) -> Response {
+    let slot_side = size.max(18.0) + 12.0;
+    let rect = Rect::from_center_size(center, vec2(slot_side, slot_side));
+    let resp = response_at(ui, rect, Sense::click());
+
+    let ctx = ui.ctx();
+    let hovered = enabled && resp.hovered() && alpha > 0.3;
+    let t = ctx.animate_value_with_time(id.with("h"), hovered as u8 as f32, 0.08);
+    let held = enabled && resp.is_pointer_button_down_on();
+    let eff_alpha = if enabled { alpha } else { alpha * 0.35 };
+
+    let p = ui.painter();
+    let base = if held { theme.held } else { theme.text };
+    let color = if fx.color {
+        mix(base, theme.accent, t)
+    } else {
+        base
+    };
+    let s = if fx.size {
+        size * (1.0 + 0.16 * t)
+    } else {
+        size
+    };
+
+    let glyph_rect = Rect::from_center_size(center, vec2(s, s));
+    paint_glyph(p, glyph, glyph_rect, fade(color, eff_alpha));
+
     if resp.hovered() && !tooltip.is_empty() {
         paint_tooltip(ui, pos2(center.x, rect.top() - 2.0), tooltip, 1.0);
     }
@@ -1510,7 +1575,9 @@ fn queue_card(
     theme: OscTheme,
     cmds: &mut Vec<OscCmd>,
 ) {
-    use crate::danmaku_ui::{settings_card_bg, settings_card_outline, settings_card_rect};
+    use crate::danmaku_ui::{
+        register_card_layer, settings_card_bg, settings_card_outline, settings_card_rect,
+    };
 
     let screen = ui.max_rect();
     let layer = egui::LayerId::new(egui::Order::Foreground, Id::unique("osc-queue-card"));
@@ -1539,6 +1606,7 @@ fn queue_card(
         .min(ROW_H * MAX_ROWS);
     let size = vec2(300.0, CARD_OVERHEAD + list_h);
     let card = settings_card_rect(screen, anchor, size);
+    register_card_layer(lui.ctx(), layer, card);
     let p = lui.painter();
     p.rect_filled(card, CornerRadius::same(14), settings_card_bg());
     p.rect_stroke(
@@ -1687,7 +1755,9 @@ fn settings_card(
     theme: OscTheme,
     cmds: &mut Vec<OscCmd>,
 ) {
-    use crate::danmaku_ui::{settings_card_bg, settings_card_outline, settings_card_rect};
+    use crate::danmaku_ui::{
+        register_card_layer, settings_card_bg, settings_card_outline, settings_card_rect,
+    };
     use dyplayer_store::{StartupView, ThemeMode};
 
     let screen = ui.max_rect();
@@ -1706,6 +1776,7 @@ fn settings_card(
 
     let size = vec2(320.0, (screen.height() - 40.0).clamp(480.0, 720.0));
     let card = settings_card_rect(screen, anchor, size);
+    register_card_layer(lui.ctx(), layer, card);
     let p = lui.painter();
     p.rect_filled(card, CornerRadius::same(14), settings_card_bg());
     p.rect_stroke(

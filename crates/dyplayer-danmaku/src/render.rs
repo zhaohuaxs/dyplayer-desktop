@@ -3,8 +3,9 @@
 //! TDD 6.5 契约：
 //! - 测量与绘制同源：与 layout 的 `DanmakuFont`/`px_scale_for_em` 完全一致，
 //!   逐字形 advance + kerning 推进，屏幕位置与碰撞边界零偏差
-//! - glyph 按 (codepoint, 量化字号, 描边半径) 缓存于单张 atlas 纹理，
-//!   fill 与膨胀 outline 双 mask；纹理仅在内容变化（dirty）时上传
+//! - glyph 按 (codepoint, 量化字号, 膨胀半径, 柔晕量化) 缓存于单张 atlas
+//!   纹理，fill（可加粗膨胀）与 outline（可烘柔晕外环）双 mask；纹理仅在
+//!   内容变化（dirty）时上传
 //! - 顶点色与纹理像素均为预乘 sRGBA（egui 0.37 约定：`from_white_alpha`
 //!   存储 (a,a,a,a)，shader 中 gamma 空间相乘 + premultiplied blending）
 //! - 单条弹幕两遍绘制：先全部 outline 再全部 fill（fill 覆盖描边内芯，
@@ -18,7 +19,7 @@ use std::collections::VecDeque;
 use crate::dfm::{FrameItem, PreparedItem};
 use crate::layout::DanmakuFont;
 use crate::normalize::{DyGradientTarget, DyStyle};
-use crate::outline::{raster_radius, resolve_width_px};
+use crate::outline::resolve_width_px;
 use crate::typography::px_scale_for_em;
 
 const ATLAS_INITIAL_SIZE: u32 = 512;
@@ -45,6 +46,9 @@ pub struct MeshParams<'a> {
     /// 渐变端点对称收缩量（0-0.25）：t < inset 恒首节点色、t > 1-inset
     /// 恒尾节点色，渐变压缩到中段（渲染参数即时生效）。
     pub gradient_inset: f32,
+    /// 描边外柔晕强度（0-1，0=off）：outline mask 烘入 r+1 衰减 alpha
+    /// 外环（模拟 text-shadow blur）；即时项，依附描边遍（无描边无柔晕）。
+    pub halo: f32,
 }
 
 /// 渐变重参数化：文本内 t（0-1）映射到收缩区间 [inset, 1-inset] 上的
@@ -76,13 +80,33 @@ struct GlyphKey {
     cp: char,
     /// px_per_em 量化到 0.25px（档位字号离散，防浮点漂移产生重复缓存）。
     size_q: u32,
-    /// 描边膨胀半径（0 = fill）。
-    radius: u16,
+    /// 膨胀半径量化到 0.25px（radius×4；分数半径防连续拖动堆缓存）。
+    radius_q: u16,
+    /// 柔晕强度量化（0-20；radius=0 时恒 0）。
+    halo_q: u8,
 }
 
 fn quantize_size(px_per_em: f32) -> u32 {
     if px_per_em.is_finite() && px_per_em > 0.0 {
         (px_per_em * 4.0).round() as u32
+    } else {
+        0
+    }
+}
+
+/// 半径量化到 0.25px 档（atlas key 维度，防连续拖动堆缓存）。
+fn quantize_radius(radius: f32) -> u16 {
+    if radius.is_finite() {
+        (radius.clamp(0.0, 16.0) * 4.0).round() as u16
+    } else {
+        0
+    }
+}
+
+/// 柔晕量化到 0.05 档（atlas key 维度，防连续拖动堆缓存）。
+fn quantize_halo(halo: f32) -> u8 {
+    if halo.is_finite() {
+        (halo.clamp(0.0, 1.0) * 20.0).round() as u8
     } else {
         0
     }
@@ -209,12 +233,16 @@ impl GlyphAtlas {
         font: &FontArc,
         ch: char,
         px_per_em: f32,
-        radius: u16,
+        radius: f32,
+        halo: f32,
     ) -> Option<AtlasGlyph> {
+        let radius_q = quantize_radius(radius);
+        let halo_q = if radius_q > 0 { quantize_halo(halo) } else { 0 };
         let key = GlyphKey {
             cp: ch,
             size_q: quantize_size(px_per_em),
-            radius,
+            radius_q,
+            halo_q,
         };
         if let Some(entry) = self.entries.get(&key) {
             return Some(*entry);
@@ -224,7 +252,14 @@ impl GlyphAtlas {
         let id = font.glyph_id(ch);
         let advance = scaled.h_advance(id);
 
-        let entry = match self.rasterize(font, id, scale, radius, advance) {
+        let entry = match self.rasterize(
+            font,
+            id,
+            scale,
+            f32::from(radius_q) / 4.0,
+            f32::from(halo_q) / 20.0,
+            advance,
+        ) {
             Some(entry) => entry,
             None => AtlasGlyph {
                 x: 0,
@@ -245,7 +280,8 @@ impl GlyphAtlas {
         font: &FontArc,
         id: GlyphId,
         scale: PxScale,
-        radius: u16,
+        radius: f32,
+        halo: f32,
         advance: f32,
     ) -> Option<AtlasGlyph> {
         let glyph = Glyph {
@@ -262,8 +298,12 @@ impl GlyphAtlas {
         }
         // 栅格化内存预算（R06）：膨胀后尺寸 (w+2r)*(h+2r) 先于分配检查，
         // 超限直接拒绝（调用方回零尺寸 fallback），不进入 w*h mask 分配。
-        let dw = w.saturating_add(2 * radius as usize);
-        let dh = h.saturating_add(2 * radius as usize);
+        // 分数半径/柔晕外环再 +1px。
+        let r = radius.floor() as u16;
+        let ring = (radius - f32::from(r)).max(halo);
+        let er = r + u16::from(ring > 0.0);
+        let dw = w.saturating_add(2 * er as usize);
+        let dh = h.saturating_add(2 * er as usize);
         if dw > GLYPH_MAX_SIDE || dh > GLYPH_MAX_SIDE || dw.saturating_mul(dh) > GLYPH_MAX_PIXELS {
             return None;
         }
@@ -274,10 +314,29 @@ impl GlyphAtlas {
             }
         });
 
-        let (mask, w, h, offset_x, offset_y) = if radius > 0 {
-            let (mask, w, h) = dilate_mask(&mask, w, h, radius);
-            let r = f32::from(radius);
-            (mask, w, h, bounds.min.x - r, bounds.min.y - r)
+        let (mask, w, h, offset_x, offset_y) = if r > 0 || ring > 0.0 {
+            let rf = f32::from(r);
+            if ring > 0.0 {
+                // 分数半径与柔晕统一：r+1 膨胀整体衰减 alpha（frac 与 halo
+                // 取 max），再与 r 硬环取 max：硬环内保持原 alpha，外 1px
+                // 软过渡（单 entry 烘入）。整数半径+halo 时与旧行为一致。
+                let (hard, hw, hh) = dilate_mask(&mask, w, h, r);
+                let (soft, sw, sh) = dilate_mask(&mask, w, h, r + 1);
+                let mut out = vec![0u8; sw * sh];
+                for (i, a) in soft.iter().enumerate() {
+                    out[i] = (f32::from(*a) * ring).round() as u8;
+                }
+                for y in 0..hh {
+                    for x in 0..hw {
+                        let oi = (y + 1) * sw + (x + 1);
+                        out[oi] = out[oi].max(hard[y * hw + x]);
+                    }
+                }
+                (out, sw, sh, bounds.min.x - rf - 1.0, bounds.min.y - rf - 1.0)
+            } else {
+                let (mask, w, h) = dilate_mask(&mask, w, h, r);
+                (mask, w, h, bounds.min.x - rf, bounds.min.y - rf)
+            }
         } else {
             (mask, w, h, bounds.min.x, bounds.min.y)
         };
@@ -405,13 +464,6 @@ fn dilate_row_1d(src: &[u8], r: usize, dst: &mut [u8]) {
     }
 }
 
-fn resolve_outline_radius(px_per_em: f32, outline_profile: f64) -> u16 {
-    if !outline_profile.is_finite() || outline_profile <= 0.0 {
-        return 0;
-    }
-    raster_radius(resolve_width_px(px_per_em, outline_profile as f32))
-}
-
 fn argb_to_rgb(argb: i32) -> (u8, u8, u8) {
     let v = argb as u32;
     (
@@ -438,9 +490,8 @@ pub fn build_danmaku_mesh(
     }
     for (frame, item) in items {
         let px_per_em = item.font_size as f32;
-        let radius = resolve_outline_radius(px_per_em, params.outline_profile);
-        prime_atlas(atlas, font, item, radius);
-        prime_atlas(atlas, font, item, 0);
+        let radius = resolve_width_px(px_per_em, params.outline_profile as f32);
+        prime_atlas(atlas, font, item, radius, params.halo);
         let _ = frame;
     }
 
@@ -451,7 +502,7 @@ pub fn build_danmaku_mesh(
     let mut mesh = Mesh::with_texture(params.texture_id);
     for (frame, item) in items {
         let px_per_em = item.font_size as f32;
-        let radius = resolve_outline_radius(px_per_em, params.outline_profile);
+        let radius = resolve_width_px(px_per_em, params.outline_profile as f32);
         let frame_alpha = item.opacity.clamp(0.0, 1.0) * frame.alpha.clamp(0.0, 1.0);
         let alpha = (frame_alpha * params.global_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         if alpha == 0 {
@@ -488,7 +539,7 @@ pub fn build_danmaku_mesh(
             None => (None, (r, g, b)),
         };
         let v_start = mesh.vertices.len();
-        if radius > 0 {
+        if radius > 0.0 {
             push_text_pass(
                 &mut mesh,
                 atlas,
@@ -499,6 +550,7 @@ pub fn build_danmaku_mesh(
                 outline_base,
                 outline_gradient,
                 params.gradient_inset,
+                params.halo,
                 alpha,
                 origin,
                 inv_ppp,
@@ -511,10 +563,11 @@ pub fn build_danmaku_mesh(
             font,
             frame,
             item,
-            0,
+            0.0,
             fill_base,
             fill_gradient,
             params.gradient_inset,
+            0.0,
             alpha,
             origin,
             inv_ppp,
@@ -538,13 +591,13 @@ pub fn build_danmaku_mesh(
     mesh
 }
 
-fn prime_atlas(atlas: &mut GlyphAtlas, font: &FontArc, item: &PreparedItem, radius: u16) {
+fn prime_atlas(atlas: &mut GlyphAtlas, font: &FontArc, item: &PreparedItem, radius: f32, halo: f32) {
     let px_per_em = item.font_size as f32;
     for ch in item.text.chars() {
         if ch.is_control() {
             continue;
         }
-        atlas.glyph(font, ch, px_per_em, radius);
+        atlas.glyph(font, ch, px_per_em, radius, halo);
     }
 }
 
@@ -561,10 +614,11 @@ fn push_text_pass(
     font: &FontArc,
     frame: &FrameItem,
     item: &PreparedItem,
-    radius: u16,
+    radius: f32,
     base_rgb: (u8, u8, u8),
     gradient: Option<&DyStyle>,
     gradient_inset: f32,
+    halo: f32,
     alpha: u8,
     origin: Pos2,
     inv_ppp: f32,
@@ -603,7 +657,7 @@ fn push_text_pass(
             pen_x += kern;
             text_x += kern;
         }
-        if let Some(entry) = atlas.glyph(font, ch, px_per_em, radius)
+        if let Some(entry) = atlas.glyph(font, ch, px_per_em, radius, halo)
             && entry.w > 0
             && entry.h > 0
         {
@@ -816,19 +870,19 @@ mod tests {
         };
         let font_arc = font.font().clone();
         let mut atlas = GlyphAtlas::new();
-        let a1 = atlas.glyph(&font_arc, '弹', 30.0, 0).unwrap();
-        let a2 = atlas.glyph(&font_arc, '弹', 30.0, 0).unwrap();
+        let a1 = atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.0).unwrap();
+        let a2 = atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.0).unwrap();
         assert_eq!(a1, a2, "同 key 必须命中缓存");
         assert!(a1.w > 0 && a1.h > 0);
         assert!(a1.advance > 0.0);
-        let outline = atlas.glyph(&font_arc, '弹', 30.0, 1).unwrap();
+        let outline = atlas.glyph(&font_arc, '弹', 30.0, 1.0, 0.0).unwrap();
         assert_ne!(outline, a1, "outline 是独立 entry");
         assert!(outline.w > a1.w, "膨胀后必须更宽");
         assert!(atlas.dirty());
         let image = atlas.image();
         assert_eq!((image.width(), image.height()), (512, 512));
         atlas.clear_dirty();
-        atlas.glyph(&font_arc, '弹', 30.0, 0);
+        atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.0);
         assert!(!atlas.dirty(), "缓存命中不得置脏");
     }
 
@@ -845,12 +899,12 @@ mod tests {
                 .chars()
                 .collect();
         for &ch in &chars {
-            atlas.glyph(&font_arc, ch, 120.0, 0);
+            atlas.glyph(&font_arc, ch, 120.0, 0.0, 0.0);
         }
         assert!(atlas.size() > 512, "24 个 120px 汉字应触发扩容");
         for &ch in &chars {
             assert!(
-                atlas.glyph(&font_arc, ch, 120.0, 0).is_some(),
+                atlas.glyph(&font_arc, ch, 120.0, 0.0, 0.0).is_some(),
                 "扩容后全部可命中"
             );
         }
@@ -872,7 +926,7 @@ mod tests {
             let size = 12.0 + step as f32 * 6.0;
             for cp in 0x4E00u32..0x9FA6 {
                 let Some(ch) = char::from_u32(cp) else { continue };
-                let entry = atlas.glyph(&font_arc, ch, size, 3).unwrap();
+                let entry = atlas.glyph(&font_arc, ch, size, 3.0, 0.0).unwrap();
                 if entry.w == 0 {
                     lost += 1;
                     if lost >= 10 {
@@ -886,7 +940,7 @@ mod tests {
         // 溢出必须请求整体重排，且重排后能重新装入（自愈，不永久丢失）。
         assert!(atlas.take_needs_reset(), "耗尽后必须请求 reset");
         atlas.reset(atlas.size());
-        let entry = atlas.glyph(&font_arc, '永', 48.0, 3).unwrap();
+        let entry = atlas.glyph(&font_arc, '永', 48.0, 3.0, 0.0).unwrap();
         assert!(entry.w > 0, "reset 后字形必须恢复");
     }
 
@@ -902,7 +956,7 @@ mod tests {
         let font_arc = font.font().clone();
         let mut atlas = GlyphAtlas::new();
         let old_size = atlas.size();
-        let e1 = atlas.glyph(&font_arc, '字', 48.0, 0).unwrap();
+        let e1 = atlas.glyph(&font_arc, '字', 48.0, 0.0, 0.0).unwrap();
         assert!(e1.w > 0 && e1.h > 0, "字形必须有效");
         // 旧像素区域快照（含 padding 行）。
         let side_old = old_size as usize;
@@ -915,7 +969,7 @@ mod tests {
         // grow 后旧字形应直接命中缓存（不重新栅格化），坐标完全不变。
         atlas.grow(old_size * 2);
         assert_eq!(atlas.size(), old_size * 2);
-        let e2 = atlas.glyph(&font_arc, '字', 48.0, 0).unwrap();
+        let e2 = atlas.glyph(&font_arc, '字', 48.0, 0.0, 0.0).unwrap();
         assert_eq!((e2.x, e2.y, e2.w, e2.h), (e1.x, e1.y, e1.w, e1.h));
         // 旧像素已复制到新缓冲对应位置（坐标不变，行 stride 变大）。
         let new_side = atlas.size() as usize;
@@ -927,7 +981,7 @@ mod tests {
             .collect();
         assert_eq!(new_pixels, old_pixels, "grow 后旧字形像素必须原位保留");
         // 新字形可在新增空间 alloc 写入（不同字符、同档位）。
-        let e3 = atlas.glyph(&font_arc, '画', 48.0, 0).unwrap();
+        let e3 = atlas.glyph(&font_arc, '画', 48.0, 0.0, 0.0).unwrap();
         assert!(e3.w > 0 && e3.h > 0, "新字形必须可写入扩容后的空间");
         assert_ne!((e3.x, e3.y), (e1.x, e1.y), "新字形不能覆盖旧字形位置");
     }
@@ -951,6 +1005,7 @@ mod tests {
             texture_id: TextureId::Managed(7),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         assert_eq!(mesh.texture_id, TextureId::Managed(7));
@@ -986,6 +1041,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         // qGray = (r*11 + g*16 + b*5) / 32；阈值 < 30 → 白描边，否则黑描边。
         for (color_argb, expect_white_outline, label) in [
@@ -1059,6 +1115,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: true,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         assert_eq!(mesh.indices.len() / 6, 3, "无描边 profile 时仅 fill");
@@ -1111,6 +1168,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: true,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         assert_eq!(mesh.indices.len() / 6, 4, "2 字符 × (outline + fill)");
@@ -1176,6 +1234,7 @@ mod tests {
                 texture_id: TextureId::Managed(0),
                 gradient_enabled: true,
                 gradient_inset: inset,
+                halo: 0.0,
             };
             let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
             mesh.vertices.iter().map(|v| v.color).collect::<Vec<_>>()
@@ -1234,6 +1293,7 @@ mod tests {
                 texture_id: TextureId::Managed(0),
                 gradient_enabled: true,
                 gradient_inset: 0.0,
+                halo: 0.0,
             };
             let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
             mesh.vertices.iter().map(|v| v.color).collect::<Vec<_>>()
@@ -1274,6 +1334,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         let expected = Color32::from_rgba_unmultiplied(0, 255, 0, 255);
@@ -1301,6 +1362,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         assert_eq!(mesh.indices.len() / 6, 2, "无描边 profile 时仅 fill");
@@ -1329,11 +1391,12 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         assert_eq!(mesh.indices.len() / 6, 2, "空格不产生 quad 只推进 pen");
         let space = atlas
-            .glyph(font.font(), ' ', 24.0, 0)
+            .glyph(font.font(), ' ', 24.0, 0.0, 0.0)
             .expect("空格 entry 必须存在（承载 advance）");
         assert_eq!((space.w, space.h), (0, 0));
         assert!(space.advance > 0.0);
@@ -1370,6 +1433,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         // 首帧含 glyph 栅格化 + 膨胀
         let first = std::time::Instant::now();
@@ -1414,6 +1478,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         // frame.alpha=0.5 * item.opacity=1.0 * global=1.0 → 128
@@ -1452,6 +1517,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         // "abc" 水平排列，旋转 90° 后 y 方向 span 应大于 x 方向 span。
@@ -1486,6 +1552,7 @@ mod tests {
             texture_id: TextureId::Managed(0),
             gradient_enabled: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         };
         let mesh = build_danmaku_mesh(&mut atlas, &params, &items);
         // outline_profile=0 → 仅 fill pass：2 字符 = 2 quad = 8 顶点。
@@ -1496,6 +1563,159 @@ mod tests {
         assert!(
             second_y > first_y,
             "第二行 y({second_y}) 应大于第一行 y({first_y})"
+        );
+    }
+
+    fn quad_width(vs: &[Vertex]) -> f32 {
+        let min = vs.iter().map(|v| v.pos.x).fold(f32::INFINITY, f32::min);
+        let max = vs.iter().map(|v| v.pos.x).fold(f32::NEG_INFINITY, f32::max);
+        max - min
+    }
+
+    #[test]
+    fn atlas_halo_bakes_attenuated_outer_ring() {
+        let Some(font) = sys_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let font_arc = font.font().clone();
+        let mut atlas = GlyphAtlas::new();
+        let plain = atlas.glyph(&font_arc, '弹', 30.0, 1.0, 0.0).unwrap();
+        let halo = atlas.glyph(&font_arc, '弹', 30.0, 1.0, 0.5).unwrap();
+        assert_ne!(plain, halo, "halo 是独立 entry");
+        assert_eq!(halo.w, plain.w + 2, "柔晕四周外扩 1px");
+        assert_eq!(halo.h, plain.h + 2);
+        let ImageData::Color(img) = atlas.image();
+        let side = img.size[0];
+        let mut inner_max = 0u8;
+        let mut frame_max = 0u8;
+        let mut frame_nonzero = false;
+        for y in 0..halo.h {
+            for x in 0..halo.w {
+                let a = img.pixels[(halo.y + y) as usize * side + (halo.x + x) as usize].r();
+                if x == 0 || y == 0 || x == halo.w - 1 || y == halo.h - 1 {
+                    frame_max = frame_max.max(a);
+                    frame_nonzero |= a > 0;
+                } else {
+                    inner_max = inner_max.max(a);
+                }
+            }
+        }
+        assert_eq!(inner_max, 255, "硬环保持原 alpha");
+        assert!(frame_nonzero, "外环应有非零 alpha");
+        assert!(
+            frame_max <= 128,
+            "外环 alpha 应被 halo=0.5 衰减，got {frame_max}"
+        );
+    }
+
+    #[test]
+    fn atlas_halo_quantized_and_fill_ignores_halo() {
+        let Some(font) = sys_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let font_arc = font.font().clone();
+        let mut atlas = GlyphAtlas::new();
+        let h0 = atlas.glyph(&font_arc, '弹', 30.0, 1.0, 0.0).unwrap();
+        let h_tiny = atlas.glyph(&font_arc, '弹', 30.0, 1.0, 0.02).unwrap();
+        assert_eq!(h0, h_tiny, "0.02 量化到 0 档，命中同 entry");
+        let f0 = atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.0).unwrap();
+        let f_halo = atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.5).unwrap();
+        assert_eq!(f0, f_halo, "fill 遍无柔晕维度");
+    }
+
+    #[test]
+    fn atlas_fractional_radius_bakes_attenuated_ring() {
+        let Some(font) = sys_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let font_arc = font.font().clone();
+        let mut atlas = GlyphAtlas::new();
+        let plain = atlas.glyph(&font_arc, '弹', 30.0, 0.0, 0.0).unwrap();
+        let half = atlas.glyph(&font_arc, '弹', 30.0, 0.5, 0.0).unwrap();
+        assert_eq!(half.w, plain.w + 2, "分数半径外扩 1px 软环");
+        assert_eq!(half.h, plain.h + 2);
+        let ImageData::Color(img) = atlas.image();
+        let side = img.width();
+        let mut frame_max = 0u8;
+        let mut inner_max = 0u8;
+        for y in 0..half.h {
+            for x in 0..half.w {
+                let a = img.pixels[(half.y + y) as usize * side + (half.x + x) as usize].r();
+                if x == 0 || y == 0 || x == half.w - 1 || y == half.h - 1 {
+                    frame_max = frame_max.max(a);
+                } else {
+                    inner_max = inner_max.max(a);
+                }
+            }
+        }
+        assert_eq!(inner_max, 255, "硬芯保持原 alpha");
+        assert!(
+            frame_max > 0 && frame_max <= 128,
+            "0.5 半径外环应半衰减，got {frame_max}"
+        );
+    }
+
+    #[test]
+    fn atlas_radius_quantized_quarter_px() {
+        let Some(font) = sys_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        let font_arc = font.font().clone();
+        let mut atlas = GlyphAtlas::new();
+        let a = atlas.glyph(&font_arc, '弹', 30.0, 0.5, 0.0).unwrap();
+        let b = atlas.glyph(&font_arc, '弹', 30.0, 0.52, 0.0).unwrap();
+        assert_eq!(a, b, "0.52 量化到 0.5 档，命中同 entry");
+        let c = atlas.glyph(&font_arc, '弹', 30.0, 0.75, 0.0).unwrap();
+        assert_ne!(a, c, "0.75 是独立档");
+    }
+
+    #[test]
+    fn mesh_halo_widens_outline_pass_only() {
+        let Some(font) = sys_font() else {
+            eprintln!("skip: no system font available");
+            return;
+        };
+        // 100/3 px → base 2.0 → outline 2 解析为整数 2px（无分数环），
+        // 柔晕 +1px 断言才精确。
+        let fs = 100.0 / 3.0;
+        let mut item = test_item("永", 0xFFFF_FFFFu32 as i32, fs);
+        item.width = font.measure("永", fs as f32).0;
+        let frame = test_frame(10.0, 10.0);
+        let items = vec![(frame, &item)];
+        let mut atlas = GlyphAtlas::new();
+        let base = MeshParams {
+            font: &font,
+            outline_profile: 2.0,
+            video_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0)),
+            pixels_per_point: 1.0,
+            global_opacity: 1.0,
+            texture_id: TextureId::Managed(0),
+            gradient_enabled: false,
+            gradient_inset: 0.0,
+            halo: 0.0,
+        };
+        let m0 = build_danmaku_mesh(&mut atlas, &base, &items);
+        let m1 = build_danmaku_mesh(
+            &mut atlas,
+            &MeshParams {
+                halo: 0.5,
+                ..base
+            },
+            &items,
+        );
+        assert_eq!(
+            quad_width(&m1.vertices[0..4]),
+            quad_width(&m0.vertices[0..4]) + 2.0,
+            "柔晕使 outline 四周 +1px"
+        );
+        assert_eq!(
+            quad_width(&m1.vertices[4..8]),
+            quad_width(&m0.vertices[4..8]),
+            "fill 不受 halo 影响"
         );
     }
 }

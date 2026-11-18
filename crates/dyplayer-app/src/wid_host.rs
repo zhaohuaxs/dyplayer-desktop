@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetForegroundWindow,
     SetParent, SetWindowLongPtrW, SetWindowPos, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWL_STYLE,
@@ -140,6 +141,7 @@ impl VideoHost {
             // SetParent 把宿主从顶级转子窗口，若此前宿主持前台则丢失；
             // 显式回拉 eframe 主窗口前台+键盘焦点，保证 winit 收到 WM_KEYDOWN。
             let _ = SetForegroundWindow(parent);
+            let _ = SetFocus(Some(parent));
         }
         self.last_rect_px = None;
     }

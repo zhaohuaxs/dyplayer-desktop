@@ -29,6 +29,7 @@ pub struct OverlayRunState {
     pub delay_seconds: f64,
     pub gradient: bool,
     pub gradient_inset: f64,
+    pub halo: f64,
 }
 
 impl Default for OverlayRunState {
@@ -41,6 +42,7 @@ impl Default for OverlayRunState {
             delay_seconds: 0.0,
             gradient: false,
             gradient_inset: 0.0,
+            halo: 0.0,
         }
     }
 }
